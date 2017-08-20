@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<todo version="0.1.20">
+    <note priority="high" time="1382537613">
+        make window always ontop
+    </note>
+    <note priority="high" time="1382537638">
+        change 3d cursor shape
+    </note>
+    <note priority="high" time="1502966541">
+        Клавиши 7, 1, 3 как то "мутно" переключают виды
+    </note>
+    <note priority="high" time="1503064970">
+        объединить конфиги в один глобальный
+    </note>
+    <note priority="high" time="1503073640">
+        povray не стартует через cpulimit(shell script обёртка)
+    </note>
+</todo>

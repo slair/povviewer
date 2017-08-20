@@ -1,0 +1,2132 @@
+diff -rupNb povray-3.7.0.0/source/backend/frame.h povdump-3.7.0.0/source/backend/frame.h
+--- povray-3.7.0.0/source/backend/frame.h	2013-11-07 00:28:15.000000000 +0400
++++ povdump-3.7.0.0/source/backend/frame.h	2016-09-16 09:54:52.607364580 +0400
+@@ -1369,6 +1369,9 @@ class ObjectBase
+ 			Ph_Density(0), RadiosityImportance(0.0), Flags(0)
+ 		{
+ 			Make_BBox(BBox, -BOUND_HUGE/2.0, -BOUND_HUGE/2.0, -BOUND_HUGE/2.0, BOUND_HUGE, BOUND_HUGE, BOUND_HUGE);
++			// +!+ slair
++			IsBaseObject=true;
++			// -!- slair
+ 		}
+ 
+ 		ObjectBase(int t, ObjectBase& o, bool transplant) :
+@@ -1388,6 +1391,9 @@ class ObjectBase
+ 				o.Clip.clear();
+ 				o.LLights.clear();
+ 			}
++			// +!+ slair
++			IsBaseObject=true;
++			// -!- slair
+ 		}
+ 		virtual ~ObjectBase() { }
+ 
+@@ -1413,6 +1419,44 @@ class ObjectBase
+ 		// isn't the place to do that anymore since a scene may persist between views).
+ 		virtual void DispatchShutdownMessages(MessageFactory& messageFactory) {};
+ 
++		// +!+ slair
++		bool IsBaseObject;
++		virtual void Dump(FILE* df, TraceThreadData *Thread)
++		{
++			if (df)
++			{
++				if (IsBaseObject)
++				{
++					fwrite("BASE",4,1,df);
++				}
++				if (Trans)
++				{
++					fwrite("TRNS",4,1,df);
++					fwrite(Trans->matrix, sizeof(Trans->matrix), 1, df);
++				}
++				else
++				{
++					fwrite("\x00\x00\x00\x00",4,1,df);
++				}
++				fwrite("BBOX",4,1,df);
++				fwrite(BBox.Lower_Left, sizeof(BBox.Lower_Left), 1, df);
++				BBOX_VECT a;
++				a[0] = BBox.Lower_Left[0] + BBox.Lengths[0];
++				a[1] = BBox.Lower_Left[1] + BBox.Lengths[1];
++				a[2] = BBox.Lower_Left[2] + BBox.Lengths[2];
++				fwrite(a, sizeof(a), 1, df);
++				if (Texture)
++				{
++					fwrite("COLR", 4, 1, df);
++					fwrite(&(Texture->Pigment->colour), sizeof(Texture->Pigment->colour), 1, df);
++				}
++				else
++				{
++					fwrite("\x00\x00\x00\x00",4,1,df);
++				}
++			}
++		};
++		// -!- slair
+ 	protected:
+ 		explicit ObjectBase(const ObjectBase&) { }
+ };
+@@ -1509,6 +1553,9 @@ class LightSource : public CompoundObjec
+ 		virtual void Transform(const TRANSFORM *);
+ 		virtual void Invert();
+ 		virtual void Compute_BBox() { }
++		// +!+ slair
++		virtual void Dump(FILE* df, TraceThreadData* Thread);
++		// -!- slair
+ };
+ 
+ typedef unsigned short HF_VAL;
+@@ -1883,7 +1930,429 @@ inline void VUnpack(Vector3d& dest_vec,
+ #define GET_THREAD_LOCAL_PTR(ptrName)                             (ptrName.get())
+ #define SET_THREAD_LOCAL_PTR(ptrName, ptrValue)                   (ptrName.reset(ptrValue))
+ #endif
++// +!+ slair
++#define DUMP(b,a) fwrite(&(a),sizeof(a),1,(b));
++#define DUMPTAG(b,a) fwrite(&(a),4,1,(b));
++#define TMPCFG_NAME "/dev/shm/scene.cfg"
++typedef struct {
++	DBL x;
++	DBL y;
++	DBL z;
++} XYZ;
++
++typedef struct {
++   XYZ p[3];
++} TRI;
++
++typedef struct {
++   XYZ p[8];
++   double val[8];
++} GRIDCELL;
++
++static void Assign_Vector(VECTOR d, XYZ s)
++{
++	d[X] = s.x;
++	d[Y] = s.y;
++	d[Z] = s.z;
++}
++
++#define ABS fabs
++/*
++   Linearly interpolate the position where an isosurface cuts
++   an edge between two vertices, each with their own scalar value
++*/
++static XYZ VertexInterp(DBL isolevel, XYZ p1, XYZ p2, DBL valp1, DBL valp2)
++{
++   DBL mu;
++   XYZ p;
++
++   if (ABS(isolevel-valp1) < 0.00001)
++      return(p1);
++   if (ABS(isolevel-valp2) < 0.00001)
++      return(p2);
++   if (ABS(valp1-valp2) < 0.00001)
++      return(p1);
++   mu = (isolevel - valp1) / (valp2 - valp1);
++   p.x = p1.x + mu * (p2.x - p1.x);
++   p.y = p1.y + mu * (p2.y - p1.y);
++   p.z = p1.z + mu * (p2.z - p1.z);
++
++   return(p);
++}
++
++/*
++   Given a grid cell and an isolevel, calculate the triangular
++   facets required to represent the isosurface through the cell.
++   Return the number of triangular facets, the array "triangles"
++   will be loaded up with the vertices at most 5 triangular facets.
++	0 will be returned if the grid cell is either totally above
++   of totally below the isolevel.
++*/
++static int Polygonise(GRIDCELL grid,double isolevel,TRI *triangles)
++{
++   int i,ntriang;
++   int cubeindex;
++   XYZ vertlist[12];
++
++int edgeTable[256]={
++0x0  , 0x109, 0x203, 0x30a, 0x406, 0x50f, 0x605, 0x70c,
++0x80c, 0x905, 0xa0f, 0xb06, 0xc0a, 0xd03, 0xe09, 0xf00,
++0x190, 0x99 , 0x393, 0x29a, 0x596, 0x49f, 0x795, 0x69c,
++0x99c, 0x895, 0xb9f, 0xa96, 0xd9a, 0xc93, 0xf99, 0xe90,
++0x230, 0x339, 0x33 , 0x13a, 0x636, 0x73f, 0x435, 0x53c,
++0xa3c, 0xb35, 0x83f, 0x936, 0xe3a, 0xf33, 0xc39, 0xd30,
++0x3a0, 0x2a9, 0x1a3, 0xaa , 0x7a6, 0x6af, 0x5a5, 0x4ac,
++0xbac, 0xaa5, 0x9af, 0x8a6, 0xfaa, 0xea3, 0xda9, 0xca0,
++0x460, 0x569, 0x663, 0x76a, 0x66 , 0x16f, 0x265, 0x36c,
++0xc6c, 0xd65, 0xe6f, 0xf66, 0x86a, 0x963, 0xa69, 0xb60,
++0x5f0, 0x4f9, 0x7f3, 0x6fa, 0x1f6, 0xff , 0x3f5, 0x2fc,
++0xdfc, 0xcf5, 0xfff, 0xef6, 0x9fa, 0x8f3, 0xbf9, 0xaf0,
++0x650, 0x759, 0x453, 0x55a, 0x256, 0x35f, 0x55 , 0x15c,
++0xe5c, 0xf55, 0xc5f, 0xd56, 0xa5a, 0xb53, 0x859, 0x950,
++0x7c0, 0x6c9, 0x5c3, 0x4ca, 0x3c6, 0x2cf, 0x1c5, 0xcc ,
++0xfcc, 0xec5, 0xdcf, 0xcc6, 0xbca, 0xac3, 0x9c9, 0x8c0,
++0x8c0, 0x9c9, 0xac3, 0xbca, 0xcc6, 0xdcf, 0xec5, 0xfcc,
++0xcc , 0x1c5, 0x2cf, 0x3c6, 0x4ca, 0x5c3, 0x6c9, 0x7c0,
++0x950, 0x859, 0xb53, 0xa5a, 0xd56, 0xc5f, 0xf55, 0xe5c,
++0x15c, 0x55 , 0x35f, 0x256, 0x55a, 0x453, 0x759, 0x650,
++0xaf0, 0xbf9, 0x8f3, 0x9fa, 0xef6, 0xfff, 0xcf5, 0xdfc,
++0x2fc, 0x3f5, 0xff , 0x1f6, 0x6fa, 0x7f3, 0x4f9, 0x5f0,
++0xb60, 0xa69, 0x963, 0x86a, 0xf66, 0xe6f, 0xd65, 0xc6c,
++0x36c, 0x265, 0x16f, 0x66 , 0x76a, 0x663, 0x569, 0x460,
++0xca0, 0xda9, 0xea3, 0xfaa, 0x8a6, 0x9af, 0xaa5, 0xbac,
++0x4ac, 0x5a5, 0x6af, 0x7a6, 0xaa , 0x1a3, 0x2a9, 0x3a0,
++0xd30, 0xc39, 0xf33, 0xe3a, 0x936, 0x83f, 0xb35, 0xa3c,
++0x53c, 0x435, 0x73f, 0x636, 0x13a, 0x33 , 0x339, 0x230,
++0xe90, 0xf99, 0xc93, 0xd9a, 0xa96, 0xb9f, 0x895, 0x99c,
++0x69c, 0x795, 0x49f, 0x596, 0x29a, 0x393, 0x99 , 0x190,
++0xf00, 0xe09, 0xd03, 0xc0a, 0xb06, 0xa0f, 0x905, 0x80c,
++0x70c, 0x605, 0x50f, 0x406, 0x30a, 0x203, 0x109, 0x0   };
++int triTable[256][16] =
++{{-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{0, 8, 3, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{0, 1, 9, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{1, 8, 3, 9, 8, 1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{1, 2, 10, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{0, 8, 3, 1, 2, 10, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{9, 2, 10, 0, 2, 9, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{2, 8, 3, 2, 10, 8, 10, 9, 8, -1, -1, -1, -1, -1, -1, -1},
++{3, 11, 2, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{0, 11, 2, 8, 11, 0, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{1, 9, 0, 2, 3, 11, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{1, 11, 2, 1, 9, 11, 9, 8, 11, -1, -1, -1, -1, -1, -1, -1},
++{3, 10, 1, 11, 10, 3, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{0, 10, 1, 0, 8, 10, 8, 11, 10, -1, -1, -1, -1, -1, -1, -1},
++{3, 9, 0, 3, 11, 9, 11, 10, 9, -1, -1, -1, -1, -1, -1, -1},
++{9, 8, 10, 10, 8, 11, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{4, 7, 8, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{4, 3, 0, 7, 3, 4, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{0, 1, 9, 8, 4, 7, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{4, 1, 9, 4, 7, 1, 7, 3, 1, -1, -1, -1, -1, -1, -1, -1},
++{1, 2, 10, 8, 4, 7, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{3, 4, 7, 3, 0, 4, 1, 2, 10, -1, -1, -1, -1, -1, -1, -1},
++{9, 2, 10, 9, 0, 2, 8, 4, 7, -1, -1, -1, -1, -1, -1, -1},
++{2, 10, 9, 2, 9, 7, 2, 7, 3, 7, 9, 4, -1, -1, -1, -1},
++{8, 4, 7, 3, 11, 2, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{11, 4, 7, 11, 2, 4, 2, 0, 4, -1, -1, -1, -1, -1, -1, -1},
++{9, 0, 1, 8, 4, 7, 2, 3, 11, -1, -1, -1, -1, -1, -1, -1},
++{4, 7, 11, 9, 4, 11, 9, 11, 2, 9, 2, 1, -1, -1, -1, -1},
++{3, 10, 1, 3, 11, 10, 7, 8, 4, -1, -1, -1, -1, -1, -1, -1},
++{1, 11, 10, 1, 4, 11, 1, 0, 4, 7, 11, 4, -1, -1, -1, -1},
++{4, 7, 8, 9, 0, 11, 9, 11, 10, 11, 0, 3, -1, -1, -1, -1},
++{4, 7, 11, 4, 11, 9, 9, 11, 10, -1, -1, -1, -1, -1, -1, -1},
++{9, 5, 4, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{9, 5, 4, 0, 8, 3, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{0, 5, 4, 1, 5, 0, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{8, 5, 4, 8, 3, 5, 3, 1, 5, -1, -1, -1, -1, -1, -1, -1},
++{1, 2, 10, 9, 5, 4, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{3, 0, 8, 1, 2, 10, 4, 9, 5, -1, -1, -1, -1, -1, -1, -1},
++{5, 2, 10, 5, 4, 2, 4, 0, 2, -1, -1, -1, -1, -1, -1, -1},
++{2, 10, 5, 3, 2, 5, 3, 5, 4, 3, 4, 8, -1, -1, -1, -1},
++{9, 5, 4, 2, 3, 11, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{0, 11, 2, 0, 8, 11, 4, 9, 5, -1, -1, -1, -1, -1, -1, -1},
++{0, 5, 4, 0, 1, 5, 2, 3, 11, -1, -1, -1, -1, -1, -1, -1},
++{2, 1, 5, 2, 5, 8, 2, 8, 11, 4, 8, 5, -1, -1, -1, -1},
++{10, 3, 11, 10, 1, 3, 9, 5, 4, -1, -1, -1, -1, -1, -1, -1},
++{4, 9, 5, 0, 8, 1, 8, 10, 1, 8, 11, 10, -1, -1, -1, -1},
++{5, 4, 0, 5, 0, 11, 5, 11, 10, 11, 0, 3, -1, -1, -1, -1},
++{5, 4, 8, 5, 8, 10, 10, 8, 11, -1, -1, -1, -1, -1, -1, -1},
++{9, 7, 8, 5, 7, 9, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{9, 3, 0, 9, 5, 3, 5, 7, 3, -1, -1, -1, -1, -1, -1, -1},
++{0, 7, 8, 0, 1, 7, 1, 5, 7, -1, -1, -1, -1, -1, -1, -1},
++{1, 5, 3, 3, 5, 7, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{9, 7, 8, 9, 5, 7, 10, 1, 2, -1, -1, -1, -1, -1, -1, -1},
++{10, 1, 2, 9, 5, 0, 5, 3, 0, 5, 7, 3, -1, -1, -1, -1},
++{8, 0, 2, 8, 2, 5, 8, 5, 7, 10, 5, 2, -1, -1, -1, -1},
++{2, 10, 5, 2, 5, 3, 3, 5, 7, -1, -1, -1, -1, -1, -1, -1},
++{7, 9, 5, 7, 8, 9, 3, 11, 2, -1, -1, -1, -1, -1, -1, -1},
++{9, 5, 7, 9, 7, 2, 9, 2, 0, 2, 7, 11, -1, -1, -1, -1},
++{2, 3, 11, 0, 1, 8, 1, 7, 8, 1, 5, 7, -1, -1, -1, -1},
++{11, 2, 1, 11, 1, 7, 7, 1, 5, -1, -1, -1, -1, -1, -1, -1},
++{9, 5, 8, 8, 5, 7, 10, 1, 3, 10, 3, 11, -1, -1, -1, -1},
++{5, 7, 0, 5, 0, 9, 7, 11, 0, 1, 0, 10, 11, 10, 0, -1},
++{11, 10, 0, 11, 0, 3, 10, 5, 0, 8, 0, 7, 5, 7, 0, -1},
++{11, 10, 5, 7, 11, 5, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{10, 6, 5, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{0, 8, 3, 5, 10, 6, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{9, 0, 1, 5, 10, 6, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{1, 8, 3, 1, 9, 8, 5, 10, 6, -1, -1, -1, -1, -1, -1, -1},
++{1, 6, 5, 2, 6, 1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{1, 6, 5, 1, 2, 6, 3, 0, 8, -1, -1, -1, -1, -1, -1, -1},
++{9, 6, 5, 9, 0, 6, 0, 2, 6, -1, -1, -1, -1, -1, -1, -1},
++{5, 9, 8, 5, 8, 2, 5, 2, 6, 3, 2, 8, -1, -1, -1, -1},
++{2, 3, 11, 10, 6, 5, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{11, 0, 8, 11, 2, 0, 10, 6, 5, -1, -1, -1, -1, -1, -1, -1},
++{0, 1, 9, 2, 3, 11, 5, 10, 6, -1, -1, -1, -1, -1, -1, -1},
++{5, 10, 6, 1, 9, 2, 9, 11, 2, 9, 8, 11, -1, -1, -1, -1},
++{6, 3, 11, 6, 5, 3, 5, 1, 3, -1, -1, -1, -1, -1, -1, -1},
++{0, 8, 11, 0, 11, 5, 0, 5, 1, 5, 11, 6, -1, -1, -1, -1},
++{3, 11, 6, 0, 3, 6, 0, 6, 5, 0, 5, 9, -1, -1, -1, -1},
++{6, 5, 9, 6, 9, 11, 11, 9, 8, -1, -1, -1, -1, -1, -1, -1},
++{5, 10, 6, 4, 7, 8, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{4, 3, 0, 4, 7, 3, 6, 5, 10, -1, -1, -1, -1, -1, -1, -1},
++{1, 9, 0, 5, 10, 6, 8, 4, 7, -1, -1, -1, -1, -1, -1, -1},
++{10, 6, 5, 1, 9, 7, 1, 7, 3, 7, 9, 4, -1, -1, -1, -1},
++{6, 1, 2, 6, 5, 1, 4, 7, 8, -1, -1, -1, -1, -1, -1, -1},
++{1, 2, 5, 5, 2, 6, 3, 0, 4, 3, 4, 7, -1, -1, -1, -1},
++{8, 4, 7, 9, 0, 5, 0, 6, 5, 0, 2, 6, -1, -1, -1, -1},
++{7, 3, 9, 7, 9, 4, 3, 2, 9, 5, 9, 6, 2, 6, 9, -1},
++{3, 11, 2, 7, 8, 4, 10, 6, 5, -1, -1, -1, -1, -1, -1, -1},
++{5, 10, 6, 4, 7, 2, 4, 2, 0, 2, 7, 11, -1, -1, -1, -1},
++{0, 1, 9, 4, 7, 8, 2, 3, 11, 5, 10, 6, -1, -1, -1, -1},
++{9, 2, 1, 9, 11, 2, 9, 4, 11, 7, 11, 4, 5, 10, 6, -1},
++{8, 4, 7, 3, 11, 5, 3, 5, 1, 5, 11, 6, -1, -1, -1, -1},
++{5, 1, 11, 5, 11, 6, 1, 0, 11, 7, 11, 4, 0, 4, 11, -1},
++{0, 5, 9, 0, 6, 5, 0, 3, 6, 11, 6, 3, 8, 4, 7, -1},
++{6, 5, 9, 6, 9, 11, 4, 7, 9, 7, 11, 9, -1, -1, -1, -1},
++{10, 4, 9, 6, 4, 10, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{4, 10, 6, 4, 9, 10, 0, 8, 3, -1, -1, -1, -1, -1, -1, -1},
++{10, 0, 1, 10, 6, 0, 6, 4, 0, -1, -1, -1, -1, -1, -1, -1},
++{8, 3, 1, 8, 1, 6, 8, 6, 4, 6, 1, 10, -1, -1, -1, -1},
++{1, 4, 9, 1, 2, 4, 2, 6, 4, -1, -1, -1, -1, -1, -1, -1},
++{3, 0, 8, 1, 2, 9, 2, 4, 9, 2, 6, 4, -1, -1, -1, -1},
++{0, 2, 4, 4, 2, 6, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{8, 3, 2, 8, 2, 4, 4, 2, 6, -1, -1, -1, -1, -1, -1, -1},
++{10, 4, 9, 10, 6, 4, 11, 2, 3, -1, -1, -1, -1, -1, -1, -1},
++{0, 8, 2, 2, 8, 11, 4, 9, 10, 4, 10, 6, -1, -1, -1, -1},
++{3, 11, 2, 0, 1, 6, 0, 6, 4, 6, 1, 10, -1, -1, -1, -1},
++{6, 4, 1, 6, 1, 10, 4, 8, 1, 2, 1, 11, 8, 11, 1, -1},
++{9, 6, 4, 9, 3, 6, 9, 1, 3, 11, 6, 3, -1, -1, -1, -1},
++{8, 11, 1, 8, 1, 0, 11, 6, 1, 9, 1, 4, 6, 4, 1, -1},
++{3, 11, 6, 3, 6, 0, 0, 6, 4, -1, -1, -1, -1, -1, -1, -1},
++{6, 4, 8, 11, 6, 8, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{7, 10, 6, 7, 8, 10, 8, 9, 10, -1, -1, -1, -1, -1, -1, -1},
++{0, 7, 3, 0, 10, 7, 0, 9, 10, 6, 7, 10, -1, -1, -1, -1},
++{10, 6, 7, 1, 10, 7, 1, 7, 8, 1, 8, 0, -1, -1, -1, -1},
++{10, 6, 7, 10, 7, 1, 1, 7, 3, -1, -1, -1, -1, -1, -1, -1},
++{1, 2, 6, 1, 6, 8, 1, 8, 9, 8, 6, 7, -1, -1, -1, -1},
++{2, 6, 9, 2, 9, 1, 6, 7, 9, 0, 9, 3, 7, 3, 9, -1},
++{7, 8, 0, 7, 0, 6, 6, 0, 2, -1, -1, -1, -1, -1, -1, -1},
++{7, 3, 2, 6, 7, 2, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{2, 3, 11, 10, 6, 8, 10, 8, 9, 8, 6, 7, -1, -1, -1, -1},
++{2, 0, 7, 2, 7, 11, 0, 9, 7, 6, 7, 10, 9, 10, 7, -1},
++{1, 8, 0, 1, 7, 8, 1, 10, 7, 6, 7, 10, 2, 3, 11, -1},
++{11, 2, 1, 11, 1, 7, 10, 6, 1, 6, 7, 1, -1, -1, -1, -1},
++{8, 9, 6, 8, 6, 7, 9, 1, 6, 11, 6, 3, 1, 3, 6, -1},
++{0, 9, 1, 11, 6, 7, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{7, 8, 0, 7, 0, 6, 3, 11, 0, 11, 6, 0, -1, -1, -1, -1},
++{7, 11, 6, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{7, 6, 11, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{3, 0, 8, 11, 7, 6, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{0, 1, 9, 11, 7, 6, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{8, 1, 9, 8, 3, 1, 11, 7, 6, -1, -1, -1, -1, -1, -1, -1},
++{10, 1, 2, 6, 11, 7, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{1, 2, 10, 3, 0, 8, 6, 11, 7, -1, -1, -1, -1, -1, -1, -1},
++{2, 9, 0, 2, 10, 9, 6, 11, 7, -1, -1, -1, -1, -1, -1, -1},
++{6, 11, 7, 2, 10, 3, 10, 8, 3, 10, 9, 8, -1, -1, -1, -1},
++{7, 2, 3, 6, 2, 7, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{7, 0, 8, 7, 6, 0, 6, 2, 0, -1, -1, -1, -1, -1, -1, -1},
++{2, 7, 6, 2, 3, 7, 0, 1, 9, -1, -1, -1, -1, -1, -1, -1},
++{1, 6, 2, 1, 8, 6, 1, 9, 8, 8, 7, 6, -1, -1, -1, -1},
++{10, 7, 6, 10, 1, 7, 1, 3, 7, -1, -1, -1, -1, -1, -1, -1},
++{10, 7, 6, 1, 7, 10, 1, 8, 7, 1, 0, 8, -1, -1, -1, -1},
++{0, 3, 7, 0, 7, 10, 0, 10, 9, 6, 10, 7, -1, -1, -1, -1},
++{7, 6, 10, 7, 10, 8, 8, 10, 9, -1, -1, -1, -1, -1, -1, -1},
++{6, 8, 4, 11, 8, 6, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{3, 6, 11, 3, 0, 6, 0, 4, 6, -1, -1, -1, -1, -1, -1, -1},
++{8, 6, 11, 8, 4, 6, 9, 0, 1, -1, -1, -1, -1, -1, -1, -1},
++{9, 4, 6, 9, 6, 3, 9, 3, 1, 11, 3, 6, -1, -1, -1, -1},
++{6, 8, 4, 6, 11, 8, 2, 10, 1, -1, -1, -1, -1, -1, -1, -1},
++{1, 2, 10, 3, 0, 11, 0, 6, 11, 0, 4, 6, -1, -1, -1, -1},
++{4, 11, 8, 4, 6, 11, 0, 2, 9, 2, 10, 9, -1, -1, -1, -1},
++{10, 9, 3, 10, 3, 2, 9, 4, 3, 11, 3, 6, 4, 6, 3, -1},
++{8, 2, 3, 8, 4, 2, 4, 6, 2, -1, -1, -1, -1, -1, -1, -1},
++{0, 4, 2, 4, 6, 2, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{1, 9, 0, 2, 3, 4, 2, 4, 6, 4, 3, 8, -1, -1, -1, -1},
++{1, 9, 4, 1, 4, 2, 2, 4, 6, -1, -1, -1, -1, -1, -1, -1},
++{8, 1, 3, 8, 6, 1, 8, 4, 6, 6, 10, 1, -1, -1, -1, -1},
++{10, 1, 0, 10, 0, 6, 6, 0, 4, -1, -1, -1, -1, -1, -1, -1},
++{4, 6, 3, 4, 3, 8, 6, 10, 3, 0, 3, 9, 10, 9, 3, -1},
++{10, 9, 4, 6, 10, 4, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{4, 9, 5, 7, 6, 11, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{0, 8, 3, 4, 9, 5, 11, 7, 6, -1, -1, -1, -1, -1, -1, -1},
++{5, 0, 1, 5, 4, 0, 7, 6, 11, -1, -1, -1, -1, -1, -1, -1},
++{11, 7, 6, 8, 3, 4, 3, 5, 4, 3, 1, 5, -1, -1, -1, -1},
++{9, 5, 4, 10, 1, 2, 7, 6, 11, -1, -1, -1, -1, -1, -1, -1},
++{6, 11, 7, 1, 2, 10, 0, 8, 3, 4, 9, 5, -1, -1, -1, -1},
++{7, 6, 11, 5, 4, 10, 4, 2, 10, 4, 0, 2, -1, -1, -1, -1},
++{3, 4, 8, 3, 5, 4, 3, 2, 5, 10, 5, 2, 11, 7, 6, -1},
++{7, 2, 3, 7, 6, 2, 5, 4, 9, -1, -1, -1, -1, -1, -1, -1},
++{9, 5, 4, 0, 8, 6, 0, 6, 2, 6, 8, 7, -1, -1, -1, -1},
++{3, 6, 2, 3, 7, 6, 1, 5, 0, 5, 4, 0, -1, -1, -1, -1},
++{6, 2, 8, 6, 8, 7, 2, 1, 8, 4, 8, 5, 1, 5, 8, -1},
++{9, 5, 4, 10, 1, 6, 1, 7, 6, 1, 3, 7, -1, -1, -1, -1},
++{1, 6, 10, 1, 7, 6, 1, 0, 7, 8, 7, 0, 9, 5, 4, -1},
++{4, 0, 10, 4, 10, 5, 0, 3, 10, 6, 10, 7, 3, 7, 10, -1},
++{7, 6, 10, 7, 10, 8, 5, 4, 10, 4, 8, 10, -1, -1, -1, -1},
++{6, 9, 5, 6, 11, 9, 11, 8, 9, -1, -1, -1, -1, -1, -1, -1},
++{3, 6, 11, 0, 6, 3, 0, 5, 6, 0, 9, 5, -1, -1, -1, -1},
++{0, 11, 8, 0, 5, 11, 0, 1, 5, 5, 6, 11, -1, -1, -1, -1},
++{6, 11, 3, 6, 3, 5, 5, 3, 1, -1, -1, -1, -1, -1, -1, -1},
++{1, 2, 10, 9, 5, 11, 9, 11, 8, 11, 5, 6, -1, -1, -1, -1},
++{0, 11, 3, 0, 6, 11, 0, 9, 6, 5, 6, 9, 1, 2, 10, -1},
++{11, 8, 5, 11, 5, 6, 8, 0, 5, 10, 5, 2, 0, 2, 5, -1},
++{6, 11, 3, 6, 3, 5, 2, 10, 3, 10, 5, 3, -1, -1, -1, -1},
++{5, 8, 9, 5, 2, 8, 5, 6, 2, 3, 8, 2, -1, -1, -1, -1},
++{9, 5, 6, 9, 6, 0, 0, 6, 2, -1, -1, -1, -1, -1, -1, -1},
++{1, 5, 8, 1, 8, 0, 5, 6, 8, 3, 8, 2, 6, 2, 8, -1},
++{1, 5, 6, 2, 1, 6, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{1, 3, 6, 1, 6, 10, 3, 8, 6, 5, 6, 9, 8, 9, 6, -1},
++{10, 1, 0, 10, 0, 6, 9, 5, 0, 5, 6, 0, -1, -1, -1, -1},
++{0, 3, 8, 5, 6, 10, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{10, 5, 6, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{11, 5, 10, 7, 5, 11, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{11, 5, 10, 11, 7, 5, 8, 3, 0, -1, -1, -1, -1, -1, -1, -1},
++{5, 11, 7, 5, 10, 11, 1, 9, 0, -1, -1, -1, -1, -1, -1, -1},
++{10, 7, 5, 10, 11, 7, 9, 8, 1, 8, 3, 1, -1, -1, -1, -1},
++{11, 1, 2, 11, 7, 1, 7, 5, 1, -1, -1, -1, -1, -1, -1, -1},
++{0, 8, 3, 1, 2, 7, 1, 7, 5, 7, 2, 11, -1, -1, -1, -1},
++{9, 7, 5, 9, 2, 7, 9, 0, 2, 2, 11, 7, -1, -1, -1, -1},
++{7, 5, 2, 7, 2, 11, 5, 9, 2, 3, 2, 8, 9, 8, 2, -1},
++{2, 5, 10, 2, 3, 5, 3, 7, 5, -1, -1, -1, -1, -1, -1, -1},
++{8, 2, 0, 8, 5, 2, 8, 7, 5, 10, 2, 5, -1, -1, -1, -1},
++{9, 0, 1, 5, 10, 3, 5, 3, 7, 3, 10, 2, -1, -1, -1, -1},
++{9, 8, 2, 9, 2, 1, 8, 7, 2, 10, 2, 5, 7, 5, 2, -1},
++{1, 3, 5, 3, 7, 5, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{0, 8, 7, 0, 7, 1, 1, 7, 5, -1, -1, -1, -1, -1, -1, -1},
++{9, 0, 3, 9, 3, 5, 5, 3, 7, -1, -1, -1, -1, -1, -1, -1},
++{9, 8, 7, 5, 9, 7, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{5, 8, 4, 5, 10, 8, 10, 11, 8, -1, -1, -1, -1, -1, -1, -1},
++{5, 0, 4, 5, 11, 0, 5, 10, 11, 11, 3, 0, -1, -1, -1, -1},
++{0, 1, 9, 8, 4, 10, 8, 10, 11, 10, 4, 5, -1, -1, -1, -1},
++{10, 11, 4, 10, 4, 5, 11, 3, 4, 9, 4, 1, 3, 1, 4, -1},
++{2, 5, 1, 2, 8, 5, 2, 11, 8, 4, 5, 8, -1, -1, -1, -1},
++{0, 4, 11, 0, 11, 3, 4, 5, 11, 2, 11, 1, 5, 1, 11, -1},
++{0, 2, 5, 0, 5, 9, 2, 11, 5, 4, 5, 8, 11, 8, 5, -1},
++{9, 4, 5, 2, 11, 3, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{2, 5, 10, 3, 5, 2, 3, 4, 5, 3, 8, 4, -1, -1, -1, -1},
++{5, 10, 2, 5, 2, 4, 4, 2, 0, -1, -1, -1, -1, -1, -1, -1},
++{3, 10, 2, 3, 5, 10, 3, 8, 5, 4, 5, 8, 0, 1, 9, -1},
++{5, 10, 2, 5, 2, 4, 1, 9, 2, 9, 4, 2, -1, -1, -1, -1},
++{8, 4, 5, 8, 5, 3, 3, 5, 1, -1, -1, -1, -1, -1, -1, -1},
++{0, 4, 5, 1, 0, 5, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{8, 4, 5, 8, 5, 3, 9, 0, 5, 0, 3, 5, -1, -1, -1, -1},
++{9, 4, 5, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{4, 11, 7, 4, 9, 11, 9, 10, 11, -1, -1, -1, -1, -1, -1, -1},
++{0, 8, 3, 4, 9, 7, 9, 11, 7, 9, 10, 11, -1, -1, -1, -1},
++{1, 10, 11, 1, 11, 4, 1, 4, 0, 7, 4, 11, -1, -1, -1, -1},
++{3, 1, 4, 3, 4, 8, 1, 10, 4, 7, 4, 11, 10, 11, 4, -1},
++{4, 11, 7, 9, 11, 4, 9, 2, 11, 9, 1, 2, -1, -1, -1, -1},
++{9, 7, 4, 9, 11, 7, 9, 1, 11, 2, 11, 1, 0, 8, 3, -1},
++{11, 7, 4, 11, 4, 2, 2, 4, 0, -1, -1, -1, -1, -1, -1, -1},
++{11, 7, 4, 11, 4, 2, 8, 3, 4, 3, 2, 4, -1, -1, -1, -1},
++{2, 9, 10, 2, 7, 9, 2, 3, 7, 7, 4, 9, -1, -1, -1, -1},
++{9, 10, 7, 9, 7, 4, 10, 2, 7, 8, 7, 0, 2, 0, 7, -1},
++{3, 7, 10, 3, 10, 2, 7, 4, 10, 1, 10, 0, 4, 0, 10, -1},
++{1, 10, 2, 8, 7, 4, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{4, 9, 1, 4, 1, 7, 7, 1, 3, -1, -1, -1, -1, -1, -1, -1},
++{4, 9, 1, 4, 1, 7, 0, 8, 1, 8, 7, 1, -1, -1, -1, -1},
++{4, 0, 3, 7, 4, 3, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{4, 8, 7, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{9, 10, 8, 10, 11, 8, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{3, 0, 9, 3, 9, 11, 11, 9, 10, -1, -1, -1, -1, -1, -1, -1},
++{0, 1, 10, 0, 10, 8, 8, 10, 11, -1, -1, -1, -1, -1, -1, -1},
++{3, 1, 10, 11, 3, 10, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{1, 2, 11, 1, 11, 9, 9, 11, 8, -1, -1, -1, -1, -1, -1, -1},
++{3, 0, 9, 3, 9, 11, 1, 2, 9, 2, 11, 9, -1, -1, -1, -1},
++{0, 2, 11, 8, 0, 11, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{3, 2, 11, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{2, 3, 8, 2, 8, 10, 10, 8, 9, -1, -1, -1, -1, -1, -1, -1},
++{9, 10, 2, 0, 9, 2, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{2, 3, 8, 2, 8, 10, 0, 1, 8, 1, 10, 8, -1, -1, -1, -1},
++{1, 10, 2, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{1, 3, 8, 9, 1, 8, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{0, 9, 1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{0, 3, 8, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1},
++{-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1}};
++
++   /*
++      Determine the index into the edge table which
++      tells us which vertices are inside of the surface
++   */
++   cubeindex = 0;
++   if (grid.val[0] < isolevel) cubeindex |= 1;
++   if (grid.val[1] < isolevel) cubeindex |= 2;
++   if (grid.val[2] < isolevel) cubeindex |= 4;
++   if (grid.val[3] < isolevel) cubeindex |= 8;
++   if (grid.val[4] < isolevel) cubeindex |= 16;
++   if (grid.val[5] < isolevel) cubeindex |= 32;
++   if (grid.val[6] < isolevel) cubeindex |= 64;
++   if (grid.val[7] < isolevel) cubeindex |= 128;
++
++   /* Cube is entirely in/out of the surface */
++   if (edgeTable[cubeindex] == 0)
++      return(0);
++
++   /* Find the vertices where the surface intersects the cube */
++   if (edgeTable[cubeindex] & 1)
++      vertlist[0] =
++         VertexInterp(isolevel,grid.p[0],grid.p[1],grid.val[0],grid.val[1]);
++   if (edgeTable[cubeindex] & 2)
++      vertlist[1] =
++         VertexInterp(isolevel,grid.p[1],grid.p[2],grid.val[1],grid.val[2]);
++   if (edgeTable[cubeindex] & 4)
++      vertlist[2] =
++         VertexInterp(isolevel,grid.p[2],grid.p[3],grid.val[2],grid.val[3]);
++   if (edgeTable[cubeindex] & 8)
++      vertlist[3] =
++         VertexInterp(isolevel,grid.p[3],grid.p[0],grid.val[3],grid.val[0]);
++   if (edgeTable[cubeindex] & 16)
++      vertlist[4] =
++         VertexInterp(isolevel,grid.p[4],grid.p[5],grid.val[4],grid.val[5]);
++   if (edgeTable[cubeindex] & 32)
++      vertlist[5] =
++         VertexInterp(isolevel,grid.p[5],grid.p[6],grid.val[5],grid.val[6]);
++   if (edgeTable[cubeindex] & 64)
++      vertlist[6] =
++         VertexInterp(isolevel,grid.p[6],grid.p[7],grid.val[6],grid.val[7]);
++   if (edgeTable[cubeindex] & 128)
++      vertlist[7] =
++         VertexInterp(isolevel,grid.p[7],grid.p[4],grid.val[7],grid.val[4]);
++   if (edgeTable[cubeindex] & 256)
++      vertlist[8] =
++         VertexInterp(isolevel,grid.p[0],grid.p[4],grid.val[0],grid.val[4]);
++   if (edgeTable[cubeindex] & 512)
++      vertlist[9] =
++         VertexInterp(isolevel,grid.p[1],grid.p[5],grid.val[1],grid.val[5]);
++   if (edgeTable[cubeindex] & 1024)
++      vertlist[10] =
++         VertexInterp(isolevel,grid.p[2],grid.p[6],grid.val[2],grid.val[6]);
++   if (edgeTable[cubeindex] & 2048)
++      vertlist[11] =
++         VertexInterp(isolevel,grid.p[3],grid.p[7],grid.val[3],grid.val[7]);
++
++   /* Create the triangle */
++   ntriang = 0;
++   for (i=0;triTable[cubeindex][i]!=-1;i+=3) {
++      triangles[ntriang].p[0] = vertlist[triTable[cubeindex][i  ]];
++      triangles[ntriang].p[1] = vertlist[triTable[cubeindex][i+1]];
++      triangles[ntriang].p[2] = vertlist[triTable[cubeindex][i+2]];
++      ntriang++;
++   }
+ 
++   return(ntriang);
++}
++// -!- slair
+ }
+ 
+ #endif
+diff -rupNb povray-3.7.0.0/source/backend/lighting/point.cpp povdump-3.7.0.0/source/backend/lighting/point.cpp
+--- povray-3.7.0.0/source/backend/lighting/point.cpp	2013-11-07 00:28:15.000000000 +0400
++++ povdump-3.7.0.0/source/backend/lighting/point.cpp	2016-09-16 09:54:52.189359773 +0400
+@@ -698,5 +698,38 @@ void LightSource::UVCoord(UV_VECT Result
+ 	if(!children.empty())
+ 		children[0]->UVCoord(Result, Inter, Thread);
+ }
+-
++// +!+ slair
++void LightSource::Dump(FILE* df, TraceThreadData* Thread)
++{
++	if (df)
++	{
++		unsigned char dummy;
++		IsBaseObject=false;
++		DUMPTAG(df, "LGHT")
++		ObjectBase::Dump(df, Thread);
++		DUMP(df, colour)
++		DUMP(df, Center)
++		DUMP(df, Direction)
++		DUMP(df, Points_At)
++		DUMP(df, Axis1)
++		DUMP(df, Axis2)
++		//~ DUMP(df, Light_Type)
++		dummy=Light_Type;
++		fwrite(&dummy, 1, 1, df);
++		DUMP(df, Coeff)
++		DUMP(df, Radius)
++		DUMP(df, Falloff)
++		DUMP(df, Fade_Distance)
++		DUMP(df, Fade_Power)
++		DUMP(df, Area_Size1)
++		DUMP(df, Area_Size2)
++		//~ DUMP(df, Area_Light)
++		dummy=Area_Light;
++		fwrite(&dummy, 1, 1, df);
++		//~ DUMP(df, Parallel)
++		dummy=Parallel;
++		fwrite(&dummy, 1, 1, df);
++	}
++};
++// -!- slair
+ }
+diff -rupNb povray-3.7.0.0/source/backend/parser/parse.cpp povdump-3.7.0.0/source/backend/parser/parse.cpp
+--- povray-3.7.0.0/source/backend/parser/parse.cpp	2013-11-07 00:28:15.000000000 +0400
++++ povdump-3.7.0.0/source/backend/parser/parse.cpp	2016-09-16 09:54:52.456362844 +0400
+@@ -508,6 +508,14 @@ void Parser::Frame_Init()
+ 	sceneData->fog = NULL;
+ 	sceneData->rainbow = NULL;
+ 	sceneData->skysphere = NULL;
++	// +!+ slair
++	if (sceneData->dump_file)
++	{
++		//~ fwrite("FRME",4,1,sceneData->dump_file);
++		DUMPTAG(sceneData->dump_file,"FRME")
++		DUMP(sceneData->dump_file, clockValue)
++	}
++	// -!- slair
+ }
+ 
+ 
+@@ -6684,6 +6692,10 @@ void Parser::Parse_Frame ()
+ 				}
+ 
+ 				Parse_Camera(sceneData->parsedCamera);
++				// +!+ slair
++				if (sceneData->dump_file)
++					sceneData->parsedCamera.Dump(sceneData->dump_file);
++				// -!- slair
+ 				if (sceneData->clocklessAnimation == true)
+ 					sceneData->cameras.push_back(sceneData->parsedCamera);
+ 			END_CASE
+@@ -9490,8 +9502,15 @@ void Parser::Post_Process (ObjectPtr Obj
+ 
+ 		// only global light sources are in Frame.Light_Sources list [trf]
+ 		if(!(Object->Type & LIGHT_GROUP_LIGHT_OBJECT))
++// +!+ slair
++		{
++// -!- slair
+ 			// add this light to the frame's list of global light sources
+ 			sceneData->lightSources.push_back((LightSource *)Object);
++// +!+ slair
++			Object->Dump(sceneData->dump_file, GetParserDataPtr());
++		}
++// -!- slair
+ 		else
+ 			// Put it into the frame's list of light-group lights
+ 			sceneData->lightGroupLightSources.push_back((LightSource *)Object);
+@@ -9671,6 +9690,10 @@ void Parser::Link_To_Frame(ObjectPtr Obj
+ 	if((Object->Clip.empty() == false) || (dynamic_cast<CSGUnion *>(Object) == NULL) || (dynamic_cast<CSGMerge *>(Object) != NULL))
+ 	{
+ 		Link(Object, sceneData->objects);
++// +!+ slair
++		if (sceneData->dump_file)
++			Object->Dump(sceneData->dump_file, GetParserDataPtr());
++// -!- slair
+ 		return;
+ 	}
+ 
+diff -rupNb povray-3.7.0.0/source/backend/scene/camera.cpp povdump-3.7.0.0/source/backend/scene/camera.cpp
+--- povray-3.7.0.0/source/backend/scene/camera.cpp	2013-11-07 00:28:15.000000000 +0400
++++ povdump-3.7.0.0/source/backend/scene/camera.cpp	2016-09-16 09:54:52.310361165 +0400
+@@ -405,5 +405,25 @@ Camera::~Camera()
+ 		Destroy_Object(*it);
+ 	Meshes.clear();
+ }
+-
++// +!+ slair
++void Camera::Dump(FILE* df)
++{
++	if (df)
++	{
++		//~ IsBaseObject=false;
++		DUMPTAG(df, "CAMR")
++		//~ ObjectBase::Dump(df);
++		DUMP(df, Type)
++		DUMP(df, H_Angle)
++		DUMP(df, V_Angle)
++		DUMP(df, Location)
++		DUMP(df, Direction)
++		DUMP(df, Up)
++		DUMP(df, Right)
++		DUMP(df, Sky)
++		DUMP(df, Look_At)
++		DUMP(df, Angle)
++	}
++};
++// -!- slair
+ }
+diff -rupNb povray-3.7.0.0/source/backend/scene/camera.h povdump-3.7.0.0/source/backend/scene/camera.h
+--- povray-3.7.0.0/source/backend/scene/camera.h	2013-11-07 00:28:15.000000000 +0400
++++ povdump-3.7.0.0/source/backend/scene/camera.h	2016-09-16 09:54:52.510363465 +0400
+@@ -102,6 +102,9 @@ public:
+ 	void Scale(const VECTOR Vector);
+ 	void Rotate(const VECTOR Vector);
+ 	void Translate(const VECTOR Vector);
++// +!+ slair
++	void Dump(FILE* df);
++// -!- slair
+ 
+ private:
+ 	void Init();
+diff -rupNb povray-3.7.0.0/source/backend/scene/scene.cpp povdump-3.7.0.0/source/backend/scene/scene.cpp
+--- povray-3.7.0.0/source/backend/scene/scene.cpp	2013-11-07 00:28:15.000000000 +0400
++++ povdump-3.7.0.0/source/backend/scene/scene.cpp	2016-09-16 09:54:52.319361268 +0400
+@@ -125,6 +125,10 @@ SceneData::SceneData() :
+ 	tree = NULL;
+ 
+ 	functionVM = new FunctionVM();
++// +!+ slair
++	dump_file = NULL;
++	tmpcfg_name = "";
++// -!- slair
+ }
+ 
+ SceneData::~SceneData()
+@@ -454,6 +458,22 @@ void Scene::StartParser(POVMS_Object& pa
+ 
+ 	sceneData->warningLevel = clip(parseOptions.TryGetInt(kPOVAttrib_WarningLevel, 9), 0, 9);
+ 
++// +!+ slair
++	if (parseOptions.TryGetBool (kPOVAttrib_NoRender, false))
++	{
++		sceneData->dump_file = fopen(POVMS_UCS2toASCIIString(parseOptions.TryGetUCS2String(kPOVAttrib_DumpFile, "scene.dump")).c_str(),"w");
++		unsigned char tmpsizes = sizeof(short int);
++		fwrite(&tmpsizes, 1, 1, sceneData->dump_file);
++		tmpsizes = sizeof(int);
++		fwrite(&tmpsizes, 1, 1, sceneData->dump_file);
++		tmpsizes = sizeof(float);
++		fwrite(&tmpsizes, 1, 1, sceneData->dump_file);
++		tmpsizes = sizeof(double);
++		fwrite(&tmpsizes, 1, 1, sceneData->dump_file);
++		DUMPTAG(sceneData->dump_file, "SCNE")
++		sceneData->tmpcfg_name=POVMS_UCS2toASCIIString(parseOptions.TryGetUCS2String(kPOVAttrib_DumpFile, "/dev/shm/scene.cfg"));
++	}
++// -!- slair
+ 	sceneData->inputFile = parseOptions.TryGetUCS2String(kPOVAttrib_InputFile, "object.pov");
+ 	sceneData->headerFile = parseOptions.TryGetUCS2String(kPOVAttrib_IncludeHeader, "");
+ 
+@@ -539,6 +559,9 @@ void Scene::StartParser(POVMS_Object& pa
+ void Scene::StopParser()
+ {
+ 	parserTasks.Stop();
++// +!+ slair
++	fclose(sceneData->dump_file);
++// -!- slair
+ 
+ 	RenderBackend::SendSceneFailedResult(sceneData->sceneId, kUserAbortErr, sceneData->frontendAddress);
+ }
+diff -rupNb povray-3.7.0.0/source/backend/scene/scene.h povdump-3.7.0.0/source/backend/scene/scene.h
+--- povray-3.7.0.0/source/backend/scene/scene.h	2013-11-07 00:28:15.000000000 +0400
++++ povdump-3.7.0.0/source/backend/scene/scene.h	2016-09-16 09:54:52.517363545 +0400
+@@ -232,6 +232,11 @@ class SceneData
+ 		unsigned int numberOfFiniteObjects;
+ 		unsigned int numberOfInfiniteObjects;
+ 
++// +!+ slair
++		FILE* dump_file;
++		string tmpcfg_name;
++// -!- slair
++
+ 		// BSP statistics // TODO - not sure if this is the best place for stats
+ 		unsigned int nodes, splitNodes, objectNodes, emptyNodes, maxObjects, maxDepth, aborts;
+ 		float averageObjects, averageDepth, averageAborts, averageAbortObjects;
+diff -rupNb povray-3.7.0.0/source/backend/shape/bezier.cpp povdump-3.7.0.0/source/backend/shape/bezier.cpp
+--- povray-3.7.0.0/source/backend/shape/bezier.cpp	2013-11-07 00:28:15.000000000 +0400
++++ povdump-3.7.0.0/source/backend/shape/bezier.cpp	2016-09-16 09:54:52.560364040 +0400
+@@ -2288,4 +2288,17 @@ void BicubicPatch::Compute_Texture_UV(co
+ 	t[1] = u1[1] + p[1] * (u2[1] - u1[1]);
+ }
+ 
++// +!+ slair
++void BicubicPatch::Dump(FILE* df, TraceThreadData* Thread)
++{
++	if (df)
++	{
++		IsBaseObject=false;
++		DUMPTAG(df, "BIPA")
++		ObjectBase::Dump(df, Thread);
++		DUMP(df, Control_Points)
++	}
++};
++// -!- slair
++
+ }
+diff -rupNb povray-3.7.0.0/source/backend/shape/bezier.h povdump-3.7.0.0/source/backend/shape/bezier.h
+--- povray-3.7.0.0/source/backend/shape/bezier.h	2013-11-07 00:28:15.000000000 +0400
++++ povdump-3.7.0.0/source/backend/shape/bezier.h	2016-09-16 09:54:52.763366375 +0400
+@@ -111,6 +111,9 @@ class BicubicPatch : public ObjectBase
+ 		virtual void Compute_BBox();
+ 
+ 		void Precompute_Patch_Values();
++// +!+ slair
++		virtual void Dump(FILE* df, TraceThreadData* Thread);
++// -!- slair
+ 	protected:
+ 		static void bezier_value(const VECTOR(*Control_Points)[4][4], DBL u0, DBL v0, VECTOR P, VECTOR N);
+ 		bool intersect_subpatch(const Ray&, const VECTOR [3], const DBL [3], const DBL [3], DBL *, VECTOR, VECTOR, DBL *, DBL *) const;
+diff -rupNb povray-3.7.0.0/source/backend/shape/blob.cpp povdump-3.7.0.0/source/backend/shape/blob.cpp
+--- povray-3.7.0.0/source/backend/shape/blob.cpp	2013-11-07 00:28:15.000000000 +0400
++++ povdump-3.7.0.0/source/backend/shape/blob.cpp	2016-09-16 09:54:52.343361544 +0400
+@@ -3299,4 +3299,253 @@ void Blob::getLocalIPoint(VECTOR lip, In
+ 	Assign_Vector(lip, isect->LocalIPoint);
+ }
+ 
++// +!+ slair
++void Blob::Dump(FILE* df, TraceThreadData *Thread)
++{
++	if (df)
++	{
++		#define BLOB_PLUS 0.5
++		#define BLOB_MINUS -0.5
++
++		unsigned int MB_RESOLUTION_X, MB_RESOLUTION_Y, MB_RESOLUTION_Z;
++
++		FILE *cfg_file;
++		cfg_file = fopen(TMPCFG_NAME, "r");
++		if (cfg_file!=NULL)
++		{
++			fseek(cfg_file, sizeof(int)*6, SEEK_SET);
++			fread(&MB_RESOLUTION_X, sizeof(MB_RESOLUTION_X), 1, cfg_file);
++			fread(&MB_RESOLUTION_Y, sizeof(MB_RESOLUTION_Y), 1, cfg_file);
++			fread(&MB_RESOLUTION_Z, sizeof(MB_RESOLUTION_Z), 1, cfg_file);
++			fclose(cfg_file);
++		}
++		else
++		{
++			MB_RESOLUTION_X = 8;
++			MB_RESOLUTION_Y = 8;
++			MB_RESOLUTION_Z = 8;
++		}
++
++		//~ BLOB *Blob = (BLOB *)obj;
++		VECTOR vpos, IPoint;
++
++		IsBaseObject=false;
++		DUMPTAG(df, "BLOB")
++		ObjectBase::Dump(df, Thread);
++
++		DBL begin_x = BBox.Lower_Left[0];
++		DBL begin_y = BBox.Lower_Left[1];
++		DBL begin_z = BBox.Lower_Left[2];
++
++		DBL length_x = BBox.Lengths[0];
++		DBL length_y = BBox.Lengths[1];
++		DBL length_z = BBox.Lengths[2];
++
++		DBL step_x = length_x / MB_RESOLUTION_X;
++		DBL step_y = length_y / MB_RESOLUTION_Y;
++		DBL step_z = length_z / MB_RESOLUTION_Z;
++
++		GRIDCELL my_grid;
++		TRI *my_tri = new TRI[10];
++
++		long int pos_iso_tri_count = ftell(df);
++		int iso_tri_count = 0;
++		//~ fwrite(&iso_tri_count, sizeof(iso_tri_count), 1, dump_file);
++		DUMP(df, iso_tri_count)
++
++		int num_triangles = 0;
++
++		for (int xc=0; xc<MB_RESOLUTION_X; xc++)
++		{
++			for (int yc=0; yc<MB_RESOLUTION_Y; yc++)
++			{
++				for (int zc=0; zc<MB_RESOLUTION_Z; zc++)
++				{
++					my_grid.p[0].x = begin_x+xc*step_x;
++					my_grid.p[0].y = begin_y+yc*step_y;
++					my_grid.p[0].z = begin_z+zc*step_z;
++					Assign_Vector(IPoint, my_grid.p[0]);
++					if(Trans != NULL)
++					{
++						//~ MInvTransPoint(vpos, IPoint, Blob->Trans);
++						Assign_Vector(vpos, IPoint);
++					}
++					else
++					{
++						Assign_Vector(vpos, IPoint);
++					}
++					//~ my_grid.val[0] = IsoSurface_Function(myIsosrf, vpos);
++					my_grid.val[0] = Inside(vpos, Thread)?BLOB_PLUS:BLOB_MINUS;
++
++					my_grid.p[1].x = begin_x+xc*step_x+step_x;
++					my_grid.p[1].y = begin_y+yc*step_y;
++					my_grid.p[1].z = begin_z+zc*step_z;
++					Assign_Vector(IPoint, my_grid.p[1]);
++					if(Trans != NULL)
++					{
++						//~ MInvTransPoint(vpos, IPoint, Blob->Trans);
++						Assign_Vector(vpos, IPoint);
++					}
++					else
++					{
++						Assign_Vector(vpos, IPoint);
++					}
++					my_grid.val[1] = Inside(vpos, Thread)?BLOB_PLUS:BLOB_MINUS;
++
++					my_grid.p[2].x = begin_x+xc*step_x+step_x;
++					my_grid.p[2].y = begin_y+yc*step_y;
++					my_grid.p[2].z = begin_z+zc*step_z+step_z;
++					Assign_Vector(IPoint, my_grid.p[2]);
++					if(Trans != NULL)
++					{
++						//~ MInvTransPoint(vpos, IPoint, Blob->Trans);
++						Assign_Vector(vpos, IPoint);
++					}
++					else
++					{
++						Assign_Vector(vpos, IPoint);
++					}
++					my_grid.val[2] = Inside(vpos, Thread)?BLOB_PLUS:BLOB_MINUS;
++
++					my_grid.p[3].x = begin_x+xc*step_x;
++					my_grid.p[3].y = begin_y+yc*step_y;
++					my_grid.p[3].z = begin_z+zc*step_z+step_z;
++					Assign_Vector(IPoint, my_grid.p[3]);
++					if(Trans != NULL)
++					{
++						//~ MInvTransPoint(vpos, IPoint, Blob->Trans);
++						Assign_Vector(vpos, IPoint);
++					}
++					else
++					{
++						Assign_Vector(vpos, IPoint);
++					}
++					my_grid.val[3] = Inside(vpos, Thread)?BLOB_PLUS:BLOB_MINUS;
++
++					my_grid.p[4].x = begin_x+xc*step_x;
++					my_grid.p[4].y = begin_y+yc*step_y+step_y;
++					my_grid.p[4].z = begin_z+zc*step_z;
++					Assign_Vector(IPoint, my_grid.p[4]);
++					if(Trans != NULL)
++					{
++						//~ MInvTransPoint(vpos, IPoint, Blob->Trans);
++						Assign_Vector(vpos, IPoint);
++					}
++					else
++					{
++						Assign_Vector(vpos, IPoint);
++					}
++					my_grid.val[4] = Inside(vpos, Thread)?BLOB_PLUS:BLOB_MINUS;
++
++					my_grid.p[5].x = begin_x+xc*step_x+step_x;
++					my_grid.p[5].y = begin_y+yc*step_y+step_y;
++					my_grid.p[5].z = begin_z+zc*step_z;
++					Assign_Vector(IPoint, my_grid.p[5]);
++					if(Trans != NULL)
++					{
++						//~ MInvTransPoint(vpos, IPoint, Blob->Trans);
++						Assign_Vector(vpos, IPoint);
++					}
++					else
++					{
++						Assign_Vector(vpos, IPoint);
++					}
++					my_grid.val[5] = Inside(vpos, Thread)?BLOB_PLUS:BLOB_MINUS;
++
++					my_grid.p[6].x = begin_x+xc*step_x+step_x;
++					my_grid.p[6].y = begin_y+yc*step_y+step_y;
++					my_grid.p[6].z = begin_z+zc*step_z+step_z;
++					Assign_Vector(IPoint, my_grid.p[6]);
++					if(Trans != NULL)
++					{
++						//~ MInvTransPoint(vpos, IPoint, Blob->Trans);
++						Assign_Vector(vpos, IPoint);
++					}
++					else
++					{
++						Assign_Vector(vpos, IPoint);
++					}
++					my_grid.val[6] = Inside(vpos, Thread)?BLOB_PLUS:BLOB_MINUS;
++
++					my_grid.p[7].x = begin_x+xc*step_x;
++					my_grid.p[7].y = begin_y+yc*step_y+step_y;
++					my_grid.p[7].z = begin_z+zc*step_z+step_z;
++					Assign_Vector(IPoint, my_grid.p[7]);
++					if(Trans != NULL)
++					{
++						//~ MInvTransPoint(vpos, IPoint, Blob->Trans);
++						Assign_Vector(vpos, IPoint);
++					}
++					else
++					{
++						Assign_Vector(vpos, IPoint);
++					}
++					my_grid.val[7] = Inside(vpos, Thread)?BLOB_PLUS:BLOB_MINUS;
++
++					num_triangles = Polygonise(my_grid, 0, my_tri);
++
++					//~ printf("\n\nDEBUG: values:\n%f, %f, %f, %f\n%f, %f, %f, %f\n num_triangles:%d\n\n", \
++						//~ my_grid.val[0], my_grid.val[1], my_grid.val[2], my_grid.val[3], \
++						//~ my_grid.val[4], my_grid.val[5], my_grid.val[6], my_grid.val[7], \
++						//~ num_triangles \
++					//~ );
++
++
++					if (num_triangles!=0)
++					{
++						iso_tri_count += num_triangles;
++						//~ fwrite(my_tri, sizeof(my_tri), num_triangles, dump_file);
++
++						for (int i=0; i<num_triangles; i++)
++						{
++							for (int j=0; j<3; j++)
++							{
++								fwrite(&(my_tri[i].p[j]), sizeof(my_tri[i].p[j]), 1, df);
++								//~ if (max_p.x<my_tri[i].p[j].x)
++									//~ max_p.x = my_tri[i].p[j].x;
++								//~ if (max_p.y<my_tri[i].p[j].y)
++									//~ max_p.y = my_tri[i].p[j].y;
++								//~ if (max_p.z<my_tri[i].p[j].z)
++									//~ max_p.z = my_tri[i].p[j].z;
++
++								//~ if (min_p.x>my_tri[i].p[j].x)
++									//~ min_p.x = my_tri[i].p[j].x;
++								//~ if (min_p.y>my_tri[i].p[j].y)
++									//~ min_p.y = my_tri[i].p[j].y;
++								//~ if (min_p.z>my_tri[i].p[j].z)
++									//~ min_p.z = my_tri[i].p[j].z;
++
++							}
++							//~ fwrite(&(my_tri[i].p[0]), sizeof(my_tri[i].p[0]), 1, dump_file);
++							//~ fwrite(&(my_tri[i].p[1]), sizeof(my_tri[i].p[1]), 1, dump_file);
++							//~ fwrite(&(my_tri[i].p[2]), sizeof(my_tri[i].p[2]), 1, dump_file);
++							//~ printf("\n %f, %f, %f", my_tri[i].p[0]);
++							//~ printf("\n %f, %f, %f", my_tri[i].p[1]);
++							//~ printf("\n %f, %f, %f", my_tri[i].p[2]);
++						}
++
++					}
++				}
++			}
++		}
++
++		//~ printf("\n\nBBOX: %f, %f, %f - %f, %f, %f", begin_x, begin_y, begin_z, length_x, length_y, length_z);
++		//~ printf("\nMAX: %f, %f, %f", max_p.x, max_p.y, max_p.z);
++		//~ printf("\nMIN: %f, %f, %f\n", min_p.x, min_p.y, min_p.z);
++
++		fseek(df, pos_iso_tri_count, SEEK_SET);
++		fwrite(&iso_tri_count, sizeof(iso_tri_count), 1, df);
++
++		fseek(df, 0L, SEEK_END);
++
++		//~ printf("\n\nDEBUG: cur_pos %d\n\n", ftell(dump_file));
++
++		//~ Dump_Trans(dump_file, obj->Trans);
++		//~ Dump_Color(dump_file, obj->Texture);
++
++		//fclose(dump_file);
++	}
++};
++// -!- slair
++
+ }
+diff -rupNb povray-3.7.0.0/source/backend/shape/blob.h povdump-3.7.0.0/source/backend/shape/blob.h
+--- povray-3.7.0.0/source/backend/shape/blob.h	2013-11-07 00:28:15.000000000 +0400
++++ povdump-3.7.0.0/source/backend/shape/blob.h	2016-09-16 09:54:52.525363637 +0400
+@@ -151,6 +151,9 @@ class Blob : public ObjectBase
+ 		static void Scale_Blob_Element(Blob_Element *Element, const VECTOR Vector);
+ 		static void Invert_Blob_Element(Blob_Element *Element);
+ 		static void Transform_Blob_Element(Blob_Element *Element, const TRANSFORM *Trans);
++// +!+ slair
++		virtual void Dump(FILE* df, TraceThreadData *Thread);
++// -!- slair
+ 	private:
+ 		static void element_normal(VECTOR Result, const VECTOR P, const Blob_Element *Element);
+ 		static int intersect_element(const VECTOR P, const VECTOR D, const Blob_Element *Element, DBL mindist, DBL *t0, DBL *t1, TraceThreadData *Thread);
+diff -rupNb povray-3.7.0.0/source/backend/shape/boxes.cpp povdump-3.7.0.0/source/backend/shape/boxes.cpp
+--- povray-3.7.0.0/source/backend/shape/boxes.cpp	2013-11-07 00:28:15.000000000 +0400
++++ povdump-3.7.0.0/source/backend/shape/boxes.cpp	2016-09-16 09:54:52.573364189 +0400
+@@ -1120,4 +1120,18 @@ bool Box::Intersect_BBox(BBoxDirection,
+ 	return true;
+ }
+ 
++// +!+ slair
++void Box::Dump(FILE* df, TraceThreadData* Thread)
++{
++	if (df)
++	{
++		IsBaseObject=false;
++		DUMPTAG(df, "BOX ")
++		ObjectBase::Dump(df, Thread);
++		DUMP(df, bounds[0])
++		DUMP(df, bounds[1])
++	}
++};
++// -!- slair
++
+ }
+diff -rupNb povray-3.7.0.0/source/backend/shape/boxes.h povdump-3.7.0.0/source/backend/shape/boxes.h
+--- povray-3.7.0.0/source/backend/shape/boxes.h	2013-11-07 00:28:15.000000000 +0400
++++ povdump-3.7.0.0/source/backend/shape/boxes.h	2016-09-16 09:54:52.768366432 +0400
+@@ -72,6 +72,9 @@ class Box : public ObjectBase
+ 		virtual bool Intersect_BBox(BBoxDirection, const BBOX_VECT&, const BBOX_VECT&, BBOX_VAL) const;
+ 
+ 		static bool Intersect(const Ray& ray, const TRANSFORM *Trans, const VECTOR Corner1, const VECTOR Corner2, DBL *Depth1, DBL *Depth2, int *Side1, int  *Side2);
++// +!+ slair
++		virtual void Dump(FILE* df, TraceThreadData* Thread);
++// -!- slair
+ };
+ 
+ }
+diff -rupNb povray-3.7.0.0/source/backend/shape/cones.cpp povdump-3.7.0.0/source/backend/shape/cones.cpp
+--- povray-3.7.0.0/source/backend/shape/cones.cpp	2013-11-07 00:28:15.000000000 +0400
++++ povdump-3.7.0.0/source/backend/shape/cones.cpp	2016-09-16 09:54:52.374361901 +0400
+@@ -960,4 +960,21 @@ void Cone::Compute_BBox()
+ 	Recompute_BBox(&BBox, Trans);
+ }
+ 
++// +!+ slair
++void Cone::Dump(FILE* df, TraceThreadData* Thread)
++{
++	if (df)
++	{
++		IsBaseObject=false;
++		DUMPTAG(df, "CONE")
++		ObjectBase::Dump(df, Thread);
++		DUMP(df, apex)
++		DUMP(df, apex_radius)
++		DUMP(df, base)
++		DUMP(df, base_radius)
++		DUMP(df, dist)
++	}
++};
++// -!- slair
++
+ }
+diff -rupNb povray-3.7.0.0/source/backend/shape/cones.h povdump-3.7.0.0/source/backend/shape/cones.h
+--- povray-3.7.0.0/source/backend/shape/cones.h	2013-11-07 00:28:15.000000000 +0400
++++ povdump-3.7.0.0/source/backend/shape/cones.h	2016-09-16 09:54:52.530363695 +0400
+@@ -83,6 +83,9 @@ class Cone : public ObjectBase
+ 
+ 		void Compute_Cone_Data();
+ 		void Compute_Cylinder_Data();
++// +!+ slair
++		virtual void Dump(FILE* df, TraceThreadData* Thread);
++// -!- slair
+ 	protected:
+ 		int Intersect(const Ray& ray, CONE_INT *Intersection, TraceThreadData *Thread) const;
+ };
+diff -rupNb povray-3.7.0.0/source/backend/shape/csg.cpp povdump-3.7.0.0/source/backend/shape/csg.cpp
+--- povray-3.7.0.0/source/backend/shape/csg.cpp	2013-11-07 00:28:15.000000000 +0400
++++ povdump-3.7.0.0/source/backend/shape/csg.cpp	2016-09-16 09:54:52.580364270 +0400
+@@ -1044,4 +1044,25 @@ void CSG::Determine_Textures(Intersectio
+ 	}
+ }
+ 
++// +!+ slair
++void CSG::Dump(FILE* df, TraceThreadData* Thread)
++{
++	if (df)
++	{
++		//~ IsBaseObject=false;
++		//~ DUMPTAG(df, "BOX ")
++		//~ ObjectBase::Dump(df);
++		//~ DUMP(df, bounds[0])
++		//~ DUMP(df, bounds[1])
++		if(!children.empty())
++		{
++			for(vector<ObjectPtr>::const_iterator Current_Sib = children.begin(); Current_Sib != children.end(); Current_Sib++)
++			{
++				(*Current_Sib)->Dump(df, Thread);
++			}
++		}
++	}
++};
++// -!- slair
++
+ }
+diff -rupNb povray-3.7.0.0/source/backend/shape/csg.h povdump-3.7.0.0/source/backend/shape/csg.h
+--- povray-3.7.0.0/source/backend/shape/csg.h	2013-11-07 00:28:15.000000000 +0400
++++ povdump-3.7.0.0/source/backend/shape/csg.h	2016-09-16 09:54:52.771366466 +0400
+@@ -73,6 +73,9 @@ class CSG : public CompoundObject
+ 
+ 		void Determine_Textures(Intersection *isect, bool hitinside, WeightedTextureVector& textures, TraceThreadData *Threaddata);
+ 		virtual CSG *Morph(void) = 0;
++// +!+ slair
++		virtual void Dump(FILE* df, TraceThreadData* Thread);
++// -!- slair
+ };
+ 
+ class CSGUnion : public CSG
+diff -rupNb povray-3.7.0.0/source/backend/shape/discs.cpp povdump-3.7.0.0/source/backend/shape/discs.cpp
+--- povray-3.7.0.0/source/backend/shape/discs.cpp	2013-11-07 00:28:15.000000000 +0400
++++ povdump-3.7.0.0/source/backend/shape/discs.cpp	2016-09-16 09:54:52.375361912 +0400
+@@ -620,4 +620,21 @@ void Disc::Compute_BBox()
+ 	Recompute_BBox(&BBox, Trans);
+ }
+ 
++// +!+ slair
++void Disc::Dump(FILE* df, TraceThreadData* Thread)
++{
++	if (df)
++	{
++		IsBaseObject=false;
++		DUMPTAG(df, "DISC")
++		ObjectBase::Dump(df, Thread);
++		DUMP(df, center)
++		DUMP(df, normal)
++		DBL o = sqrt(oradius2), i=sqrt(iradius2);
++		DUMP(df, o)
++		DUMP(df, i)
++	}
++};
++// -!- slair
++
+ }
+diff -rupNb povray-3.7.0.0/source/backend/shape/discs.h povdump-3.7.0.0/source/backend/shape/discs.h
+--- povray-3.7.0.0/source/backend/shape/discs.h	2013-11-07 00:28:15.000000000 +0400
++++ povdump-3.7.0.0/source/backend/shape/discs.h	2016-09-16 09:54:52.532363718 +0400
+@@ -75,6 +75,9 @@ class Disc : public ObjectBase
+ 		virtual void Compute_BBox();
+ 
+ 		void Compute_Disc();
++// +!+ slair
++		virtual void Dump(FILE* df, TraceThreadData* Thread);
++// -!- slair
+ 	protected:
+ 		bool Intersect(const Ray& ray, DBL *Depth) const;
+ };
+diff -rupNb povray-3.7.0.0/source/backend/shape/hfield.cpp povdump-3.7.0.0/source/backend/shape/hfield.cpp
+--- povray-3.7.0.0/source/backend/shape/hfield.cpp	2013-11-07 00:28:15.000000000 +0400
++++ povdump-3.7.0.0/source/backend/shape/hfield.cpp	2016-09-16 09:54:52.603364534 +0400
+@@ -2095,4 +2095,63 @@ bool HField::block_traversal(const Ray &
+ 	return(found);
+ }
+ 
++// +!+ slair
++void HField::Dump(FILE* df, TraceThreadData* Thread)
++{
++	if (df)
++	{
++		IsBaseObject=false;
++		DUMPTAG(df, "HFLD")
++		ObjectBase::Dump(df, Thread);
++		DUMP(df, bounding_corner1)
++		DUMP(df, bounding_corner2)
++		DUMP(df, Data->max_x)
++		DUMP(df, Data->max_z)
++		DUMP(df, Data->min_y)
++		DUMP(df, Data->max_y)
++		DUMP(df, Data->block_max_x)
++		DUMP(df, Data->block_max_z)
++		DUMP(df, Data->block_width_x)
++		DUMP(df, Data->block_width_z)
++
++		#define Get_Height(x, z) ((DBL)Data->Map[(z)][(x)])
++		#define _LERP(a, b, t) ( ((b) - (a)) * (t) + (a) )
++		if (Data->Map != NULL)
++		{
++			DUMPTAG(df, "HMAP")
++			for (int z = 0; z < Data->max_z+2; z++)
++			{
++				for (int x = 0; x < Data->max_x+2; x++)
++				{
++					DBL wy = Get_Height(x, z);
++					wy -= Data->min_y;
++					wy /= (Data->max_y - Data->min_y);
++					wy = _LERP(bounding_corner1[1], bounding_corner2[1], wy);
++					fwrite(&wy, sizeof(wy), 1, df);
++				}
++			}
++		}
++		else
++		{
++			DUMPTAG(df, "\x00\x00\x00\x00")
++		}
++		if (Data->Normals != NULL)
++		{
++			DUMPTAG(df, "HNOR")
++			for (int z = 0; z < Data->max_z+2; z++)
++			{
++				for (int x = 0; x < Data->max_x+2; x++)
++				{
++					fwrite(Data->Normals[z][x], sizeof(short)*3, 1, df);
++				}
++			}
++		}
++		else
++		{
++			DUMPTAG(df, "\x00\x00\x00\x00")
++		}
++	}
++};
++// -!- slair
++
+ }
+diff -rupNb povray-3.7.0.0/source/backend/shape/hfield.h povdump-3.7.0.0/source/backend/shape/hfield.h
+--- povray-3.7.0.0/source/backend/shape/hfield.h	2013-11-07 00:28:15.000000000 +0400
++++ povdump-3.7.0.0/source/backend/shape/hfield.h	2016-09-16 09:54:52.776366524 +0400
+@@ -109,6 +109,9 @@ class HField : public ObjectBase
+ 		virtual void Compute_BBox();
+ 
+ 		void Compute_HField(const ImageData *image);
++// +!+ slair
++		virtual void Dump(FILE* df, TraceThreadData* Thread);
++// -!- slair
+ 	protected:
+ 		static DBL normalize(VECTOR A, const VECTOR B);
+ 		void smooth_height_field(int xsize, int zsize);
+diff -rupNb povray-3.7.0.0/source/backend/shape/isosurf.cpp povdump-3.7.0.0/source/backend/shape/isosurf.cpp
+--- povray-3.7.0.0/source/backend/shape/isosurf.cpp	2013-11-07 00:28:15.000000000 +0400
++++ povdump-3.7.0.0/source/backend/shape/isosurf.cpp	2016-09-16 09:54:52.382361993 +0400
+@@ -1175,5 +1175,253 @@ DBL IsoSurface::Evaluate_Function(FPUCon
+ 	return POVFPU_Run(ctx, funct);
+ }
+ 
++// +!+ slair
++void IsoSurface::Dump(FILE* df, TraceThreadData* Thread)
++{
++	if (df)
++	{
++		unsigned int MB_RESOLUTION_X, MB_RESOLUTION_Y, MB_RESOLUTION_Z;
++
++		FILE *cfg_file;
++		cfg_file = fopen(TMPCFG_NAME, "r");
++		if (cfg_file!=NULL)
++		{
++			fread(&MB_RESOLUTION_X, sizeof(MB_RESOLUTION_X), 1, cfg_file);
++			fread(&MB_RESOLUTION_Y, sizeof(MB_RESOLUTION_Y), 1, cfg_file);
++			fread(&MB_RESOLUTION_Z, sizeof(MB_RESOLUTION_Z), 1, cfg_file);
++			fclose(cfg_file);
++		}
++		else
++		{
++			MB_RESOLUTION_X = 8;
++			MB_RESOLUTION_Y = 8;
++			MB_RESOLUTION_Z = 8;
++		}
++
++		VECTOR vpos, IPoint;
++
++		//~ FILE *dump_file;
++		//~ dump_file = fopen(DUMP_FILENAME,"a");
++		//~ fclose(dump_file);
++		//~ dump_file = fopen(DUMP_FILENAME,"r+");
++		//~ fseek(dump_file, 0L, SEEK_END);
++
++		//~ fwrite(tag_ISOSURFACE, 4, 1, dump_file);
++		//~ Dump_BASE(obj, dump_file);
++		IsBaseObject=false;
++		DUMPTAG(df, "ISOS")
++		ObjectBase::Dump(df, Thread);
++		//fwrite(obj->BBox.Lower_Left, sizeof(obj->BBox.Lower_Left), 1, dump_file);
++
++		//~ DBL begin_x = obj->BBox.Lower_Left[0];
++		//~ DBL begin_y = obj->BBox.Lower_Left[1];
++		//~ DBL begin_z = obj->BBox.Lower_Left[2];
++		DBL begin_x = -1;
++		DBL begin_y = -1;
++		DBL begin_z = -1;
++
++		//~ DBL length_x = obj->BBox.Lengths[0];
++		//~ DBL length_y = obj->BBox.Lengths[1];
++		//~ DBL length_z = obj->BBox.Lengths[2];
++		DBL length_x = 2;
++		DBL length_y = 2;
++		DBL length_z = 2;
++
++		DBL step_x = length_x / MB_RESOLUTION_X;
++		DBL step_y = length_y / MB_RESOLUTION_Y;
++		DBL step_z = length_z / MB_RESOLUTION_Z;
++
++		//~ BBOX_VECT a;
++		//~ a[0] = obj->BBox.Lower_Left[0];
++		//~ a[1] = obj->BBox.Lower_Left[1];
++		//~ a[2] = obj->BBox.Lower_Left[2];
++		//~ a[0] += obj->BBox.Lengths[0];
++		//~ a[1] += obj->BBox.Lengths[1];
++		//~ a[2] += obj->BBox.Lengths[2];
++		//~ fwrite(a, sizeof(a), 1, dump_file);
++
++		GRIDCELL my_grid;
++		TRI *my_tri = new TRI[10];
++
++		long int pos_iso_tri_count = ftell(df);
++		//~ printf("\n\nDEBUG: pos_to_write: %d\n\n", pos_iso_tri_count);
++		int iso_tri_count = 0;
++		fwrite(&iso_tri_count, sizeof(iso_tri_count), 1, df);
++
++		int num_triangles = 0;
++
++		for (int xc=0; xc<MB_RESOLUTION_X; xc++)
++		{
++			for (int yc=0; yc<MB_RESOLUTION_Y; yc++)
++			{
++				for (int zc=0; zc<MB_RESOLUTION_Z; zc++)
++				{
++					my_grid.p[0].x = begin_x+xc*step_x;
++					my_grid.p[0].y = begin_y+yc*step_y;
++					my_grid.p[0].z = begin_z+zc*step_z;
++					Assign_Vector(IPoint, my_grid.p[0]);
++					if(Trans != NULL)
++					{
++						//~ MInvTransPoint(vpos, IPoint, myIsosrf->Trans);
++						Assign_Vector(vpos, IPoint);
++					}
++					else
++					{
++						Assign_Vector(vpos, IPoint);
++					}
++					//~ my_grid.val[0] = IsoSurface_Function(myIsosrf, vpos);
++					my_grid.val[0] = Vector_Function(Thread->functionContext, vpos);
++
++					my_grid.p[1].x = begin_x+xc*step_x+step_x;
++					my_grid.p[1].y = begin_y+yc*step_y;
++					my_grid.p[1].z = begin_z+zc*step_z;
++					Assign_Vector(IPoint, my_grid.p[1]);
++					if(Trans != NULL)
++					{
++						//~ MInvTransPoint(vpos, IPoint, myIsosrf->Trans);
++						Assign_Vector(vpos, IPoint);
++					}
++					else
++					{
++						Assign_Vector(vpos, IPoint);
++					}
++					my_grid.val[1] = Vector_Function(Thread->functionContext, vpos);
++
++					my_grid.p[2].x = begin_x+xc*step_x+step_x;
++					my_grid.p[2].y = begin_y+yc*step_y;
++					my_grid.p[2].z = begin_z+zc*step_z+step_z;
++					Assign_Vector(IPoint, my_grid.p[2]);
++					if(Trans != NULL)
++					{
++						//~ MInvTransPoint(vpos, IPoint, myIsosrf->Trans);
++						Assign_Vector(vpos, IPoint);
++					}
++					else
++					{
++						Assign_Vector(vpos, IPoint);
++					}
++					my_grid.val[2] = Vector_Function(Thread->functionContext, vpos);
++
++					my_grid.p[3].x = begin_x+xc*step_x;
++					my_grid.p[3].y = begin_y+yc*step_y;
++					my_grid.p[3].z = begin_z+zc*step_z+step_z;
++					Assign_Vector(IPoint, my_grid.p[3]);
++					if(Trans != NULL)
++					{
++						//~ MInvTransPoint(vpos, IPoint, myIsosrf->Trans);
++						Assign_Vector(vpos, IPoint);
++					}
++					else
++					{
++						Assign_Vector(vpos, IPoint);
++					}
++					my_grid.val[3] = Vector_Function(Thread->functionContext, vpos);
++
++					my_grid.p[4].x = begin_x+xc*step_x;
++					my_grid.p[4].y = begin_y+yc*step_y+step_y;
++					my_grid.p[4].z = begin_z+zc*step_z;
++					Assign_Vector(IPoint, my_grid.p[4]);
++					if(Trans != NULL)
++					{
++						//~ MInvTransPoint(vpos, IPoint, myIsosrf->Trans);
++						Assign_Vector(vpos, IPoint);
++					}
++					else
++					{
++						Assign_Vector(vpos, IPoint);
++					}
++					my_grid.val[4] = Vector_Function(Thread->functionContext, vpos);
++
++					my_grid.p[5].x = begin_x+xc*step_x+step_x;
++					my_grid.p[5].y = begin_y+yc*step_y+step_y;
++					my_grid.p[5].z = begin_z+zc*step_z;
++					Assign_Vector(IPoint, my_grid.p[5]);
++					if(Trans != NULL)
++					{
++						//~ MInvTransPoint(vpos, IPoint, myIsosrf->Trans);
++						Assign_Vector(vpos, IPoint);
++					}
++					else
++					{
++						Assign_Vector(vpos, IPoint);
++					}
++					my_grid.val[5] = Vector_Function(Thread->functionContext, vpos);
++
++					my_grid.p[6].x = begin_x+xc*step_x+step_x;
++					my_grid.p[6].y = begin_y+yc*step_y+step_y;
++					my_grid.p[6].z = begin_z+zc*step_z+step_z;
++					Assign_Vector(IPoint, my_grid.p[6]);
++					if(Trans != NULL)
++					{
++						//~ MInvTransPoint(vpos, IPoint, myIsosrf->Trans);
++						Assign_Vector(vpos, IPoint);
++					}
++					else
++					{
++						Assign_Vector(vpos, IPoint);
++					}
++					my_grid.val[6] = Vector_Function(Thread->functionContext, vpos);
++
++					my_grid.p[7].x = begin_x+xc*step_x;
++					my_grid.p[7].y = begin_y+yc*step_y+step_y;
++					my_grid.p[7].z = begin_z+zc*step_z+step_z;
++					Assign_Vector(IPoint, my_grid.p[7]);
++					if(Trans != NULL)
++					{
++						//~ MInvTransPoint(vpos, IPoint, myIsosrf->Trans);
++						Assign_Vector(vpos, IPoint);
++					}
++					else
++					{
++						Assign_Vector(vpos, IPoint);
++					}
++					my_grid.val[7] = Vector_Function(Thread->functionContext, vpos);
++
++					num_triangles = Polygonise(my_grid, 0, my_tri);
++
++					/*
++					printf("\n\nDEBUG: values:\n%f, %f, %f, %f\n%f, %f, %f, %f\n num_triangles:%d\n\n", \
++						my_grid.val[0], my_grid.val[1], my_grid.val[2], my_grid.val[3], \
++						my_grid.val[4], my_grid.val[5], my_grid.val[6], my_grid.val[7], \
++						num_triangles \
++					);
++					*/
++
++
++					if (num_triangles!=0)
++					{
++						iso_tri_count += num_triangles;
++						//~ fwrite(my_tri, sizeof(my_tri), num_triangles, dump_file);
++
++						for (int i=0; i<num_triangles; i++)
++						{
++							fwrite(&(my_tri[i].p[0]), sizeof(my_tri[i].p[0]), 1, df);
++							fwrite(&(my_tri[i].p[1]), sizeof(my_tri[i].p[1]), 1, df);
++							fwrite(&(my_tri[i].p[2]), sizeof(my_tri[i].p[2]), 1, df);
++						}
++
++					}
++				}
++			}
++		}
++
++		//~ printf("\n\nDEBUG: iso_tri_count: %d cur_pos:%d\n\n", iso_tri_count, ftell(dump_file));
++
++		fseek(df, pos_iso_tri_count, SEEK_SET);
++		//~ printf("\n\nDEBUG: write_to %d\n\n", ftell(dump_file));
++		fwrite(&iso_tri_count, sizeof(iso_tri_count), 1, df);
++
++		fseek(df, 0L, SEEK_END);
++
++		//~ printf("\n\nDEBUG: cur_pos %d\n\n", ftell(dump_file));
++
++		//~ Dump_Trans(dump_file, obj->Trans);
++		//~ Dump_Color(dump_file, obj->Texture);
++
++		//~ fclose(dump_file);
++	}
++};
++// -!- slair
++
+ }
+ 
+diff -rupNb povray-3.7.0.0/source/backend/shape/isosurf.h povdump-3.7.0.0/source/backend/shape/isosurf.h
+--- povray-3.7.0.0/source/backend/shape/isosurf.h	2013-11-07 00:28:15.000000000 +0400
++++ povdump-3.7.0.0/source/backend/shape/isosurf.h	2016-09-16 09:54:52.545363868 +0400
+@@ -125,7 +125,9 @@ class IsoSurface : public ObjectBase
+ 		virtual void Compute_BBox();
+ 
+ 		virtual void DispatchShutdownMessages(MessageFactory& messageFactory);
+-
++// +!+ slair
++		virtual void Dump(FILE* df, TraceThreadData* Thread);
++// -!- slair
+ 	protected:
+ 		bool Function_Find_Root(ISO_ThreadData& itd, const VECTOR, const VECTOR, DBL*, DBL*, DBL& max_gradient, bool in_shadow_test);
+ 		bool Function_Find_Root_R(ISO_ThreadData& itd, const ISO_Pair*, const ISO_Pair*, DBL, DBL, DBL, DBL& max_gradient);
+diff -rupNb povray-3.7.0.0/source/backend/shape/lathe.cpp povdump-3.7.0.0/source/backend/shape/lathe.cpp
+--- povray-3.7.0.0/source/backend/shape/lathe.cpp	2013-11-07 00:28:15.000000000 +0400
++++ povdump-3.7.0.0/source/backend/shape/lathe.cpp	2016-09-16 09:54:52.622364753 +0400
+@@ -1433,4 +1433,27 @@ void Lathe::UVCoord(UV_VECT Result, cons
+ 		Result[V] = 1.0;
+ }
+ 
++// +!+ slair
++void Lathe::Dump(FILE* df, TraceThreadData* Thread)
++{
++	if (df)
++	{
++		IsBaseObject=false;
++		DUMPTAG(df, "LATH")
++		ObjectBase::Dump(df, Thread);
++		DUMP(df, Spline_Type)
++		DUMP(df, Number)
++		DUMP(df, Radius1)
++		DUMP(df, Radius2)
++		DUMP(df, Height1)
++		DUMP(df, Height2)
++		for (int i=0; i < Number; i++)
++		{
++			//~ fwrite(&(obj->Spline->Entry[i]), sizeof(obj->Spline->Entry[i]), 1, dump_file);
++			DUMP(df, Spline->Entry[i])
++		}
++	}
++};
++// -!- slair
++
+ }
+diff -rupNb povray-3.7.0.0/source/backend/shape/lathe.h povdump-3.7.0.0/source/backend/shape/lathe.h
+--- povray-3.7.0.0/source/backend/shape/lathe.h	2013-11-07 00:28:15.000000000 +0400
++++ povdump-3.7.0.0/source/backend/shape/lathe.h	2016-09-16 09:54:52.782366593 +0400
+@@ -102,6 +102,9 @@ class Lathe : public ObjectBase
+ 		virtual void Compute_BBox();
+ 
+ 		void Compute_Lathe(UV_VECT *P, TraceThreadData *);
++// +!+ slair
++		virtual void Dump(FILE* df, TraceThreadData* Thread);
++// -!- slair
+ 	protected:
+ 		bool Intersect(const Ray& ray, IStack& Depth_Stack, TraceThreadData *Thread);
+ 		bool test_hit(const Ray&, IStack&, DBL, DBL, int, TraceThreadData *Thread);
+diff -rupNb povray-3.7.0.0/source/backend/shape/mesh.cpp povdump-3.7.0.0/source/backend/shape/mesh.cpp
+--- povray-3.7.0.0/source/backend/shape/mesh.cpp	2013-11-07 00:28:15.000000000 +0400
++++ povdump-3.7.0.0/source/backend/shape/mesh.cpp	2016-09-16 09:54:52.392362108 +0400
+@@ -2523,4 +2523,29 @@ void Mesh::Determine_Textures(Intersecti
+ 		textures.push_back(WeightedTexture(1.0, Texture));
+ }
+ 
++// +!+ slair
++void Mesh::Dump(FILE* df, TraceThreadData* Thread)
++{
++	if (df)
++	{
++		IsBaseObject=false;
++		DUMPTAG(df, "MESH")
++		ObjectBase::Dump(df, Thread);
++		DUMP(df, Data->Number_Of_Triangles)
++		for (int i=0; i < Data->Number_Of_Triangles; i++)
++		{
++			MESH_TRIANGLE *pTri = &Data->Triangles[i];
++			VECTOR P1, P2, P3;
++			get_triangle_vertices(pTri, P1, P2, P3);
++			DUMP(df, P1)
++			DUMP(df, P2)
++			DUMP(df, P3)
++			//~ fwrite(P1, sizeof(P1), 1, dump_file);
++			//~ fwrite(P2, sizeof(P2), 1, dump_file);
++			//~ fwrite(P3, sizeof(P3), 1, dump_file);
++		}
++	}
++};
++// -!- slair
++
+ }
+diff -rupNb povray-3.7.0.0/source/backend/shape/mesh.h povdump-3.7.0.0/source/backend/shape/mesh.h
+--- povray-3.7.0.0/source/backend/shape/mesh.h	2013-11-07 00:28:15.000000000 +0400
++++ povdump-3.7.0.0/source/backend/shape/mesh.h	2016-09-16 09:54:52.562364063 +0400
+@@ -139,6 +139,9 @@ class Mesh : public ObjectBase
+ 		void Smooth_Mesh_Normal(VECTOR Result, const MESH_TRIANGLE *Triangle, const VECTOR IPoint) const;
+ 
+ 		void Determine_Textures(Intersection *, bool, WeightedTextureVector&, TraceThreadData *);
++// +!+ slair
++		virtual void Dump(FILE* df, TraceThreadData* Thread);
++// -!- slair
+ 	protected:
+ 		bool Intersect(const Ray& ray, IStack& Depth_Stack, TraceThreadData *Thread);
+ 		void Compute_Mesh_BBox();
+diff -rupNb povray-3.7.0.0/source/backend/shape/planes.cpp povdump-3.7.0.0/source/backend/shape/planes.cpp
+--- povray-3.7.0.0/source/backend/shape/planes.cpp	2013-11-07 00:28:15.000000000 +0400
++++ povdump-3.7.0.0/source/backend/shape/planes.cpp	2016-09-16 09:54:52.394362131 +0400
+@@ -626,4 +626,18 @@ bool Plane::Intersect_BBox(BBoxDirection
+ 	return true;
+ }
+ 
++// +!+ slair
++void Plane::Dump(FILE* df, TraceThreadData* Thread)
++{
++	if (df)
++	{
++		IsBaseObject=false;
++		DUMPTAG(df, "PLAN")
++		ObjectBase::Dump(df, Thread);
++		DUMP(df, Normal_Vector)
++		DUMP(df, Distance)
++	}
++};
++// -!- slair
++
+ }
+diff -rupNb povray-3.7.0.0/source/backend/shape/planes.h povdump-3.7.0.0/source/backend/shape/planes.h
+--- povray-3.7.0.0/source/backend/shape/planes.h	2013-11-07 00:28:15.000000000 +0400
++++ povdump-3.7.0.0/source/backend/shape/planes.h	2016-09-16 09:54:52.564364086 +0400
+@@ -71,6 +71,9 @@ class Plane : public ObjectBase
+ 		virtual void Invert();
+ 		virtual void Compute_BBox();
+ 		virtual bool Intersect_BBox(BBoxDirection, const BBOX_VECT&, const BBOX_VECT&, BBOX_VAL) const;
++// +!+ slair
++		virtual void Dump(FILE* df, TraceThreadData* Thread);
++// -!- slair
+ 	protected:
+ 		bool Intersect(const Ray& ray, DBL *Depth, TraceThreadData *Thread) const;
+ };
+diff -rupNb povray-3.7.0.0/source/backend/shape/polygon.cpp povdump-3.7.0.0/source/backend/shape/polygon.cpp
+--- povray-3.7.0.0/source/backend/shape/polygon.cpp	2013-11-07 00:28:15.000000000 +0400
++++ povdump-3.7.0.0/source/backend/shape/polygon.cpp	2016-09-16 09:54:52.403362234 +0400
+@@ -1009,4 +1009,23 @@ bool Polygon::in_polygon(int number, UV_
+ 	return(inside_flag);
+ }
+ 
++// +!+ slair
++void Polygon::Dump(FILE* df, TraceThreadData* Thread)
++{
++	if (df)
++	{
++		IsBaseObject=false;
++		DUMPTAG(df, "POLY")
++		ObjectBase::Dump(df, Thread);
++		DUMP(df, S_Normal)
++		DUMP(df, Data->Number)
++		for(int i=0; i < Data->Number; i++)
++		{
++			//~ fwrite(obj->Data->Points[i], sizeof(obj->Data->Points[i]), 1, dump_file);
++			DUMP(df, Data->Points[i])
++		}
++	}
++};
++// -!- slair
++
+ }
+diff -rupNb povray-3.7.0.0/source/backend/shape/polygon.h povdump-3.7.0.0/source/backend/shape/polygon.h
+--- povray-3.7.0.0/source/backend/shape/polygon.h	2013-11-07 00:28:15.000000000 +0400
++++ povdump-3.7.0.0/source/backend/shape/polygon.h	2016-09-16 09:54:52.569364143 +0400
+@@ -81,6 +81,9 @@ class Polygon : public ObjectBase
+ 		virtual void Compute_BBox();
+ 
+ 		void Compute_Polygon(int number, VECTOR *points);
++// +!+ slair
++		virtual void Dump(FILE* df, TraceThreadData* Thread);
++// -!- slair
+ 	protected:
+ 		bool Intersect(const Ray& ray, DBL *Depth, TraceThreadData *Thread) const;
+ 		static bool in_polygon(int number, UV_VECT *points, DBL u, DBL  v);
+diff -rupNb povray-3.7.0.0/source/backend/shape/prism.cpp povdump-3.7.0.0/source/backend/shape/prism.cpp
+--- povray-3.7.0.0/source/backend/shape/prism.cpp	2013-11-07 00:28:15.000000000 +0400
++++ povdump-3.7.0.0/source/backend/shape/prism.cpp	2016-09-16 09:54:52.645365017 +0400
+@@ -1756,4 +1756,32 @@ void Prism::Compute_Prism(UV_VECT *P, Tr
+ 	}
+ }
+ 
++// +!+ slair
++void Prism::Dump(FILE* df, TraceThreadData* Thread)
++{
++	if (df)
++	{
++		IsBaseObject=false;
++		DUMPTAG(df, "PRSM")
++		ObjectBase::Dump(df, Thread);
++		DUMP(df, Number)
++		DUMP(df, Spline_Type)
++		DUMP(df, Sweep_Type)
++		DUMP(df, Height1)
++		DUMP(df, Height2)
++		for(int i=0; i<Number; i++)
++		{
++			DUMP(df, Spline->Entry[i].x1)
++			DUMP(df, Spline->Entry[i].y1)
++			DUMP(df, Spline->Entry[i].x2)
++			DUMP(df, Spline->Entry[i].y2)
++			DUMP(df, Spline->Entry[i].A)
++			DUMP(df, Spline->Entry[i].B)
++			DUMP(df, Spline->Entry[i].C)
++			DUMP(df, Spline->Entry[i].D)
++		}
++	}
++};
++// -!- slair
++
+ }
+diff -rupNb povray-3.7.0.0/source/backend/shape/prism.h povdump-3.7.0.0/source/backend/shape/prism.h
+--- povray-3.7.0.0/source/backend/shape/prism.h	2013-11-07 00:28:15.000000000 +0400
++++ povdump-3.7.0.0/source/backend/shape/prism.h	2016-09-16 09:54:52.793366719 +0400
+@@ -104,6 +104,9 @@ class Prism : public ObjectBase
+ 		virtual void Compute_BBox();
+ 
+ 		void Compute_Prism(UV_VECT *P, TraceThreadData *Thread);
++// +!+ slair
++		virtual void Dump(FILE* df, TraceThreadData* Thread);
++// -!- slair
+ 	protected:
+ 		int in_curve(DBL u, DBL v, TraceThreadData *Thread) const;
+ 		static bool test_rectangle(const VECTOR P, const VECTOR D, DBL x1, DBL y1, DBL x2, DBL y2);
+diff -rupNb povray-3.7.0.0/source/backend/shape/spheres.cpp povdump-3.7.0.0/source/backend/shape/spheres.cpp
+--- povray-3.7.0.0/source/backend/shape/spheres.cpp	2013-11-07 00:28:15.000000000 +0400
++++ povdump-3.7.0.0/source/backend/shape/spheres.cpp	2016-09-16 09:54:52.408362292 +0400
+@@ -817,4 +817,18 @@ bool Sphere::Intersect_BBox(BBoxDirectio
+ 	return true;
+ }
+ 
++// +!+ slair
++void Sphere::Dump(FILE* df, TraceThreadData* Thread)
++{
++	if (df)
++	{
++		IsBaseObject=false;
++		DUMPTAG(df, "SPHR")
++		ObjectBase::Dump(df, Thread);
++		DUMP(df, Center)
++		DUMP(df, Radius)
++	}
++};
++// -!- slair
++
+ }
+diff -rupNb povray-3.7.0.0/source/backend/shape/spheres.h povdump-3.7.0.0/source/backend/shape/spheres.h
+--- povray-3.7.0.0/source/backend/shape/spheres.h	2013-11-07 00:28:15.000000000 +0400
++++ povdump-3.7.0.0/source/backend/shape/spheres.h	2016-09-16 09:54:52.575364212 +0400
+@@ -72,6 +72,9 @@ class Sphere : public ObjectBase
+ 		virtual bool Intersect_BBox(BBoxDirection, const BBOX_VECT&, const BBOX_VECT&, BBOX_VAL) const;
+ 
+ 		static bool Intersect(const Ray& ray, const VECTOR Center, DBL Radius2, DBL *Depth1, DBL  *Depth2);
++// +!+ slair
++		virtual void Dump(FILE* df, TraceThreadData* Thread);
++// -!- slair
+ 	private:
+ 		bool Do_Ellipsoid; // TODO - parser needs to take care of this
+ };
+diff -rupNb povray-3.7.0.0/source/backend/shape/sphsweep.cpp povdump-3.7.0.0/source/backend/shape/sphsweep.cpp
+--- povray-3.7.0.0/source/backend/shape/sphsweep.cpp	2013-11-07 00:28:15.000000000 +0400
++++ povdump-3.7.0.0/source/backend/shape/sphsweep.cpp	2016-09-16 09:54:52.669365293 +0400
+@@ -1891,4 +1891,46 @@ int SphereSweep::bezier_01(int degree, c
+ 	return 0;
+ }
+ 
++// +!+ slair
++void SphereSweep::Dump(FILE* df, TraceThreadData* Thread)
++{
++	if (df)
++	{
++		IsBaseObject=false;
++		DUMPTAG(df, "SPSW")
++		ObjectBase::Dump(df, Thread);
++		DUMP(df, Interpolation)
++		DUMP(df, Num_Modeling_Spheres)
++		for(int i=0; i<Num_Modeling_Spheres; i++)
++		{
++			DUMP(df, Modeling_Sphere[i].Center)
++			DUMP(df, Modeling_Sphere[i].Radius)
++		}
++		DUMP(df, Num_Spheres)
++		for(int i=0; i<Num_Spheres; i++)
++		{
++			DUMP(df, Sphere[i].Center)
++			DUMP(df, Sphere[i].Radius)
++		}
++		DUMP(df, Num_Segments)
++		for(int i=0; i<Num_Segments; i++)
++		{
++			DUMP(df, Segment[i].Closing_Sphere[0])
++			DUMP(df, Segment[i].Closing_Sphere[1])
++			DUMP(df, Segment[i].Center_Deriv[0])
++			DUMP(df, Segment[i].Center_Deriv[1])
++			DUMP(df, Segment[i].Radius_Deriv[0])
++			DUMP(df, Segment[i].Radius_Deriv[1])
++			DUMP(df, Segment[i].Num_Coefs)
++			for(int j=0; j<SPH_SWP_MAX_COEFS; j++)
++			{
++				DUMP(df, Segment[i].Center_Coef[j])
++				DUMP(df, Segment[i].Radius_Coef[j])
++			}
++		}
++		DUMP(df, Depth_Tolerance)
++	}
++};
++// -!- slair
++
+ }
+diff -rupNb povray-3.7.0.0/source/backend/shape/sphsweep.h povdump-3.7.0.0/source/backend/shape/sphsweep.h
+--- povray-3.7.0.0/source/backend/shape/sphsweep.h	2013-11-07 00:28:15.000000000 +0400
++++ povdump-3.7.0.0/source/backend/shape/sphsweep.h	2016-09-16 09:54:52.798366777 +0400
+@@ -123,6 +123,9 @@ class SphereSweep : public ObjectBase
+ 		virtual void Compute_BBox();
+ 
+ 		void Compute();
++// +!+ slair
++		virtual void Dump(FILE* df, TraceThreadData* Thread);
++// -!- slair
+ 	protected:
+ 		bool Intersect(Ray& ray, VECTOR Center, DBL Radius2, DBL *Depth1, DBL *Depth2);
+ 		static bool Intersect_Sphere(const Ray &ray, const SPHSWEEP_SPH *Sphere, SPHSWEEP_INT *Isect);
+diff -rupNb povray-3.7.0.0/source/backend/shape/torus.cpp povdump-3.7.0.0/source/backend/shape/torus.cpp
+--- povray-3.7.0.0/source/backend/shape/torus.cpp	2013-11-07 00:28:15.000000000 +0400
++++ povdump-3.7.0.0/source/backend/shape/torus.cpp	2016-09-16 09:54:52.676365374 +0400
+@@ -994,4 +994,18 @@ void Torus::CalcUV(const VECTOR IPoint,
+ 	Result[V] = v;
+ }
+ 
++// +!+ slair
++void Torus::Dump(FILE* df, TraceThreadData* Thread)
++{
++	if (df)
++	{
++		IsBaseObject=false;
++		DUMPTAG(df, "TORS")
++		ObjectBase::Dump(df, Thread);
++		DUMP(df, MajorRadius)
++		DUMP(df, MinorRadius)
++	}
++};
++// -!- slair
++
+ }
+diff -rupNb povray-3.7.0.0/source/backend/shape/torus.h povdump-3.7.0.0/source/backend/shape/torus.h
+--- povray-3.7.0.0/source/backend/shape/torus.h	2013-11-07 00:28:15.000000000 +0400
++++ povdump-3.7.0.0/source/backend/shape/torus.h	2016-09-16 09:54:52.801366811 +0400
+@@ -80,6 +80,9 @@ class Torus : public ObjectBase
+ 		virtual void Transform(const TRANSFORM *);
+ 		virtual void Invert();
+ 		virtual void Compute_BBox();
++// +!+ slair
++		virtual void Dump(FILE* df, TraceThreadData* Thread);
++// -!- slair
+ 	protected:
+ 		int Intersect(const Ray& ray, DBL *Depth, TraceThreadData *Thread) const;
+ 		bool Test_Thick_Cylinder(const VECTOR P, const VECTOR D, DBL h1, DBL h2, DBL r1, DBL r2) const;
+diff -rupNb povray-3.7.0.0/source/backend/shape/triangle.cpp povdump-3.7.0.0/source/backend/shape/triangle.cpp
+--- povray-3.7.0.0/source/backend/shape/triangle.cpp	2013-11-07 00:28:15.000000000 +0400
++++ povdump-3.7.0.0/source/backend/shape/triangle.cpp	2016-09-16 09:54:52.419362418 +0400
+@@ -1491,4 +1491,35 @@ bool Triangle::Intersect_BBox(BBoxDirect
+ 	return true;
+ }
+ 
++// +!+ slair
++void Triangle::Dump(FILE* df, TraceThreadData* Thread)
++{
++	if (df)
++	{
++		IsBaseObject=false;
++		DUMPTAG(df, "TRIA")
++		ObjectBase::Dump(df, Thread);
++		DUMP(df, P1)
++		DUMP(df, P2)
++		DUMP(df, P3)
++		DUMP(df, Normal_Vector)
++	}
++};
++void SmoothTriangle::Dump(FILE* df, TraceThreadData* Thread)
++{
++	if (df)
++	{
++		IsBaseObject=false;
++		DUMPTAG(df, "STRI")
++		ObjectBase::Dump(df, Thread);
++		DUMP(df, P1)
++		DUMP(df, P2)
++		DUMP(df, P3)
++		DUMP(df, N1)
++		DUMP(df, N2)
++		DUMP(df, N3)
++	}
++};
++// -!- slair
++
+ }
+diff -rupNb povray-3.7.0.0/source/backend/shape/triangle.h povdump-3.7.0.0/source/backend/shape/triangle.h
+--- povray-3.7.0.0/source/backend/shape/triangle.h	2013-11-07 00:28:15.000000000 +0400
++++ povdump-3.7.0.0/source/backend/shape/triangle.h	2016-09-16 09:54:52.594364431 +0400
+@@ -78,6 +78,9 @@ class Triangle : public ObjectBase
+ 		virtual bool Intersect_BBox(BBoxDirection, const BBOX_VECT&, const BBOX_VECT&, BBOX_VAL) const;
+ 
+ 		virtual bool Compute_Triangle();
++// +!+ slair
++		virtual void Dump(FILE* df, TraceThreadData* Thread);
++// -!- slair
+ 	protected:
+ 		bool Intersect(const Ray& ray, DBL *Depth) const;
+ 		void find_triangle_dominant_axis();
+@@ -102,6 +105,9 @@ class SmoothTriangle : public Triangle
+ 		virtual bool Compute_Triangle();
+ 
+ 		static DBL Calculate_Smooth_T(const VECTOR IPoint, const VECTOR P1, const VECTOR P2, const VECTOR P3);
++// +!+ slair
++		virtual void Dump(FILE* df, TraceThreadData* Thread);
++// -!- slair
+ 	protected:
+ 		bool Compute_Smooth_Triangle();
+ };
+diff -rupNb povray-3.7.0.0/source/backend/shape/truetype.cpp povdump-3.7.0.0/source/backend/shape/truetype.cpp
+--- povray-3.7.0.0/source/backend/shape/truetype.cpp	2013-11-07 00:28:15.000000000 +0400
++++ povdump-3.7.0.0/source/backend/shape/truetype.cpp	2016-09-16 09:54:52.683365455 +0400
+@@ -3170,5 +3170,31 @@ void TrueType::Compute_BBox()
+ 	Recompute_BBox(&BBox, Trans);
+ }
+ 
++// +!+ slair
++void TrueType::Dump(FILE* df, TraceThreadData* Thread)
++{
++	if (df)
++	{
++		IsBaseObject=false;
++		DUMPTAG(df, "TTF_")
++		ObjectBase::Dump(df, Thread);
++		DUMP(df, depth)
++		DUMP(df, glyph->header.numContours)
++		for (int i=0; i<glyph->header.numContours; i++)
++		{
++			//~ fwrite(&(glyph->contours[i].count), sizeof(glyph->contours[i].count), 1, dump_file);
++			DUMP(df, glyph->contours[i].count)
++			for (int j=0; j<glyph->contours[i].count; j++)
++			{
++				//~ fwrite(&(glyph->contours[i].x[j]), sizeof(glyph->contours[i].x[j]), 1, dump_file);
++				//~ fwrite(&(glyph->contours[i].y[j]), sizeof(glyph->contours[i].y[j]), 1, dump_file);
++				DUMP(df, glyph->contours[i].x[j])
++				DUMP(df, glyph->contours[i].y[j])
++			}
++		}
++	}
++};
++// -!- slair
++
+ }
+ 
+diff -rupNb povray-3.7.0.0/source/backend/shape/truetype.h povdump-3.7.0.0/source/backend/shape/truetype.h
+--- povray-3.7.0.0/source/backend/shape/truetype.h	2013-11-07 00:28:15.000000000 +0400
++++ povdump-3.7.0.0/source/backend/shape/truetype.h	2016-09-16 09:54:52.805366857 +0400
+@@ -78,6 +78,9 @@ class TrueType : public ObjectBase
+ 		virtual void Compute_BBox();
+ 
+ 		static void ProcessNewTTF(CSG *Object, const char *filename, const int font_id, const UCS2 *text_string, DBL depth, const VECTOR offset, Parser *parser, shared_ptr<SceneData>& sceneData);
++// +!+ slair
++		virtual void Dump(FILE* df, TraceThreadData* Thread);
++// -!- slair
+ 	protected:
+ 		bool Inside_Glyph(double x, double y, const GlyphStruct* glyph) const;
+ 		int solve_quad(double *x, double *y, double mindist, DBL maxdist) const;
+diff -rupNb povray-3.7.0.0/source/base/povmsgid.h povdump-3.7.0.0/source/base/povmsgid.h
+--- povray-3.7.0.0/source/base/povmsgid.h	2013-11-07 00:28:15.000000000 +0400
++++ povdump-3.7.0.0/source/base/povmsgid.h	2016-09-16 09:54:52.622364753 +0400
+@@ -641,6 +641,12 @@ enum
+ 	kPOVAttrib_EndColumn             = kPOVAttrib_Right,
+ 	kPOVAttrib_StartRow              = kPOVAttrib_Top,
+ 	kPOVAttrib_EndRow                = kPOVAttrib_Bottom
++// +!+ slair
++	,
++	kPOVAttrib_NoRender              = 'NoRe',
++	kPOVAttrib_DumpFile              = 'DuFi',
++	kPOVAttrib_TmpCfgName            = 'TcNa'
++// -!- slair
+ };
+ 
+ // Add new stats ONLY at the end!!!
+diff -rupNb povray-3.7.0.0/source/frontend/processrenderoptions.cpp povdump-3.7.0.0/source/frontend/processrenderoptions.cpp
+--- povray-3.7.0.0/source/frontend/processrenderoptions.cpp	2013-11-07 00:28:15.000000000 +0400
++++ povdump-3.7.0.0/source/frontend/processrenderoptions.cpp	2016-09-16 09:54:52.888367812 +0400
+@@ -219,6 +219,11 @@ struct ProcessOptions::INI_Parser_Table
+ 	{ "Warning_Level",       kPOVAttrib_WarningLevel,       kPOVMSType_Int },
+ 	{ "Width",               kPOVAttrib_Width,              kPOVMSType_Int },
+ 	{ "Work_Threads",        kPOVAttrib_MaxRenderThreads,   kPOVMSType_Int },
++// +!+ slair
++	{ "NoRender",            kPOVAttrib_NoRender,           kPOVMSType_Bool },
++	{ "Dump_File_Name",      kPOVAttrib_DumpFile,           kPOVMSType_UCS2String },
++	{ "TmpCfg_File_Name",    kPOVAttrib_TmpCfgName,         kPOVMSType_UCS2String },
++// -!- slair
+ 
+ 	{ NULL, 0, 0 }
+ };
+@@ -244,6 +249,9 @@ struct ProcessOptions::Cmd_Parser_Table
+ 	{ "B",   kNoParameter,                  kNoParameter,           kPOVAttrib_Bounding },
+ 
+ 	{ "C",   kNoParameter,                  kNoParameter,           kPOVAttrib_ContinueTrace },
++// +!+ slair
++	{ "DF",   kPOVAttrib_DumpFile,           kPOVMSType_UCS2String,  kNoParameter },
++// -!- slair
+ 
+ 	{ "D",   kPOVAttrib_Display,            kUseSpecialHandler,     kPOVAttrib_Display },
+ 	{ "D",   kNoParameter,                  kNoParameter,           kPOVAttrib_Display },
+@@ -295,6 +303,9 @@ struct ProcessOptions::Cmd_Parser_Table
+ 	{ "MB",  kNoParameter,                  kNoParameter,           kPOVAttrib_Bounding },
+ 	{ "MI",  kPOVAttrib_MaxImageBufferMem,  kPOVMSType_Int,         kNoParameter },
+ 	{ "MV",  kPOVAttrib_Version,            kPOVMSType_Float,       kNoParameter },
++// +!+ slair
++	{ "NR",  kNoParameter,                  kNoParameter,           kPOVAttrib_NoRender },
++// -!- slair
+ 
+ 	{ "O",   kPOVAttrib_OutputFile,         kPOVMSType_UCS2String,  kNoParameter },
+ 
+@@ -318,6 +329,9 @@ struct ProcessOptions::Cmd_Parser_Table
+ 	{ "SR",  kPOVAttrib_Top,                kPOVMSType_Float,       kNoParameter },
+ 	{ "STP", kPOVAttrib_FrameStep,          kPOVMSType_Int,         kNoParameter },
+ 	{ "SU",  kNoParameter,                  kNoParameter,           kPOVAttrib_SplitUnions },
++// +!+ slair
++	{ "TC",   kPOVAttrib_TmpCfgName,        kPOVMSType_UCS2String,  kNoParameter },
++// -!- slair
+ 
+ 	{ "TH",  kPOVAttrib_DitherMethod,       kUseSpecialHandler,     kPOVAttrib_Dither },
+ 	{ "TH",  kNoParameter,                  kNoParameter,           kPOVAttrib_Dither },
+diff -rupNb povray-3.7.0.0/source/frontend/renderfrontend.cpp povdump-3.7.0.0/source/frontend/renderfrontend.cpp
+--- povray-3.7.0.0/source/frontend/renderfrontend.cpp	2013-11-07 00:28:15.000000000 +0400
++++ povdump-3.7.0.0/source/frontend/renderfrontend.cpp	2016-09-16 09:54:52.665365247 +0400
+@@ -196,6 +196,24 @@ RenderFrontendBase::SceneId RenderFronte
+ 	{
+ 		shd.scenepath = Path(obj.TryGetUCS2String(kPOVAttrib_InputFile, ""));
+ 		shd.scenepath.SetFile("");
++// +!+ slair
++		if (obj.TryGetBool (kPOVAttrib_NoRender, false))
++		{
++			shd.dumppath = Path(obj.TryGetUCS2String(kPOVAttrib_DumpFile, "/dev/shm/scene.dump"));
++			shd.dumppath.SetFile("");
++			shd.tmpcfgpath = Path(obj.TryGetUCS2String(kPOVAttrib_TmpCfgName, "/dev/shm/scene.cfg"));
++			shd.tmpcfgpath.SetFile("");
++			//~ string dump_file_path = POVMS_UCS2toASCIIString(obj.TryGetUCS2String(kPOVAttrib_DumpFile, "/dev/shm/scene.dump"));
++			//~ shd.dump_file = fopen(dump_file_path.c_str(),"w");
++		}
++		else
++		{
++			shd.dumppath = Path(obj.TryGetUCS2String(kPOVAttrib_DumpFile, ""));
++			shd.dumppath.SetFile("");
++			shd.tmpcfgpath = Path(obj.TryGetUCS2String(kPOVAttrib_TmpCfgName, ""));
++			shd.tmpcfgpath.SetFile("");
++		}
++// -!- slair
+ 
+ 		shd.outputpath = Path(obj.TryGetUCS2String(kPOVAttrib_OutputPath, ""));
+ 		// TODO FIXME BEGIN - this should not be needed, determine reason and fix [trf]
+diff -rupNb povray-3.7.0.0/source/frontend/renderfrontend.h povdump-3.7.0.0/source/frontend/renderfrontend.h
+--- povray-3.7.0.0/source/frontend/renderfrontend.h	2013-11-07 00:28:15.000000000 +0400
++++ povdump-3.7.0.0/source/frontend/renderfrontend.h	2016-09-16 09:54:52.891367846 +0400
+@@ -100,6 +100,10 @@ struct SceneData
+ 
+ 	Path scenepath;
+ 	Path outputpath;
++// +!+ slair
++	Path dumppath;
++	Path tmpcfgpath;
++// -!- slair
+ 
+ 	list<Path> searchpaths;
+ 
+diff -rupNb povray-3.7.0.0/vfe/vfe.cpp povdump-3.7.0.0/vfe/vfe.cpp
+--- povray-3.7.0.0/vfe/vfe.cpp	2013-11-07 00:28:15.000000000 +0400
++++ povdump-3.7.0.0/vfe/vfe.cpp	2016-09-16 09:54:53.067369870 +0400
+@@ -1076,6 +1076,38 @@ State VirtualFrontEnd::Process()
+             // case.
+             return state;
+           }
++// +!+ slair
++					//~ int finalFrame = opts.TryGetInt (kPOVAttrib_FinalFrame, 0) ;
++					//~ if (options.GetBool(kPOVAttrib_NoRender))
++					if (options.TryGetBool (kPOVAttrib_NoRender, false))
++					{
++						string slair_msg("=== No Render! Only dump to '");
++						slair_msg=slair_msg+POVMS_UCS2toASCIIString(options.TryGetUCS2String(kPOVAttrib_DumpFile,"/dev/shm/scene.dump"))+"' ===";
++						m_Session->AppendStatusMessage (slair_msg);
++						try
++						{
++							shelloutProcessing->ProcessEvent(ShelloutProcessing::postFrame);
++						}
++						catch (pov_base::Exception& e)
++						{
++							// if it's a kCannotOpenFileErr, it means permission to run the process was denied
++							// we don't set failed in that case as we allow shelloutprocessing to handle it
++							m_Session->AppendErrorAndStatusMessage (e.what());
++							if (!e.codevalid() || (e.code() != kCannotOpenFileErr))
++							{
++								m_Session->SetFailed();
++								return state = kFailed;
++							}
++						}
++
++						// check for cancel here: if the return value is true, state has already been changed
++						if (HandleShelloutCancel())
++							return state;
++						return state = kPostFrameShellout;
++					}
++					else
++					{
++// -!- slair
+           try { viewId = renderFrontend.CreateView(sceneId, options, imageProcessing, boost::bind(&vfe::VirtualFrontEnd::CreateDisplay, this, _1, _2, _3)); }
+           catch(pov_base::Exception& e)
+           {
+@@ -1133,6 +1165,9 @@ State VirtualFrontEnd::Process()
+               disp->Show () ;
+           }
+           return state = kRendering;
++// +!+ slair
++					}
++// -!- slair
+       }
+       return kParsing;
+ 

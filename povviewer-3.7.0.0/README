@@ -1,0 +1,213 @@
+# -*- coding: utf-8 -*-
+
+	Compile and install.
+	--------------------
+
+	for compile can be used codeblocks
+		povviewer.cbp - is project file
+		makefile also added
+
+	1.  compile povdump as povray
+
+				./configure COMPILED_BY=...
+			other options set as povray settings on your machine --prefix=/usr or /usr/local etc
+
+				make
+			and then don't make install, just copy povray binary in /usr/bin or /usr/local/bin or
+			another folder where povdump will be accessible via $PATH
+
+	2.  compile povviewer
+			place povviewer binary in PATH directory or not
+
+	for testing
+		cd povviewer/scenes
+		povviewer test.pov
+	or
+		bin/Debug/povviewer test.pov
+
+
+
+	Usage.
+	------
+
+	simple to run:
+		povviewer my_scene.pov
+
+	- povdump must be accessible via PATH, i place it in /usr/local/bin/ on my slackware
+	- also needed /dev/shm for store scene dump
+	  add this line to your /etc/fstab
+	    tmpfs  /dev/shm  tmpfs  defaults  0  0
+
+	in any case you can change sources to adapt povviewer to you system
+
+
+
+	Interface.
+	----------
+
+	some info writed in stdout console (in debug version)
+
+	in window title:
+		pt - parse time
+		lt - load time
+
+	total time to show scene is pt + lt
+
+	on screen texts:
+		spd - speed of movement camera (just for debug)
+		pos - position of camera
+		up/fup - camera up vector (f mean fixed)
+		lat - look at (navigator position)
+		angle (persp/ortho) - fov angle for perspective camera or some zoom for ortho camera
+		fps - is a fps (frame per second)
+
+	navigator - simple shape as diamond colored as RGB - XYZ
+
+
+
+	Hot keys.
+	---------
+
+	ESC - quit
+
+	modifiers:
+		default mod = 1
+		CTRL  - mod = 0.1
+		ALT   - mod = mod * 100
+		SHIFT - mod = mod * 0.01
+	mod affect on all actions which increase or decrease any parameters
+
+	LMB + motion - rotate camera around position
+	MMB + motion - rotate camera around navigator
+
+	MOUSE WHEEL - zoom camera
+
+	w,s,a,d,r,f - camera movement
+	q,e - rotate camera around direction if up vector is not fixed
+	CURSOR UP/DOWN - move navigator forward/backward
+	PAGEUP/PAGEDOWN - change navigator size
+
+	SPACE - toggle show navigator
+
+	F1  - show/hide bounding boxes
+	F2  - show/hide dots
+	F3  - show/hide lines
+	F4  - show/hide faces
+	F5  - reload scene
+	F6  - toggle smooth normals and reload scene
+	F7  - show/hide povray camera
+	F12 - show/hide normals
+	BACKSPACE - toggle antialias
+
+	p - "take screenshot" (run povray with current camera position)
+	x,y,z - toggle axis visibility
+	u - toggle setup camera as povray scene camera on load scene
+
+	KEYPAD0 - set camera to povray scene camera position
+	KEYPAD1 - set camera to ortho and front view
+	KEYPAD3 - set camera to ortho and right view
+	KEYPAD5 - toggle camera ortho/perspective
+	KEYPAD7 - set camera to ortho and up view
+	KEYPAD* - toggle fixation of camera up vector
+	KEYPAD+/KEYPAD- - increase/decrease scene clock and reload scene
+
+	RMB - aim camera to nearest object center
+
+	F11 - toggle stereo mode on/off
+	n,m - increase/decrease distance beetween eyes, in stereo mode
+
+	v,b - make background darker/lighter
+	c - reset background to default
+
+
+	How to change parameters.
+	-------------------------
+
+	In main scene file you can place some directives. Its important, in file which name is given
+	to povviewer as parameter. Not in included files.
+
+		povviewer main_scene_file.pov
+
+	This file scanned before every time when scene parsed with povdump and scene dump is loaded
+	into povviewer.
+
+	Place at begin of line needed directive. Syntax is:
+
+		// povviewer:window_height=384
+		// povviewer:window_width=512
+
+	There is parameters list with example values:
+
+		window_width=512
+		window_height=512
+		cam_zfar=100000
+		cam_znear=0.001
+		bgcolor=0.847059,0.784314,0.752941
+		location=0,0,-9
+		direction=0,0,1
+		up=0,1,0
+		fixed_up=0,1,0
+		right=-1,0,0
+		angle=90
+		ortho_size=6.35
+		distance_to_nav=9
+		up_fixed=1
+		max_speed=10
+		delta_speed=0.01
+		delta_rotation=0.005
+		perspective=0
+		antialias=0
+		show_navigator=1
+		navigator_size=0.04
+		show_axis=1,1,0
+		axis_size=1000
+		stereo_cam=0
+		stereo_base_size=0.04
+		font=-monotype-andale mono-medium-r-normal--10-0-0-0-c-0-iso8859-1
+
+		isoresolution=32,32,32
+		quadresolution=32,32,32
+		blobresolution=64,64,64
+		patchresolution=4
+		cone_num_latitudes=3
+		cone_num_longitudes=16
+		sphere_num_latitudes=8
+		sphere_num_longitudes=16
+		lathe_num_longitudes=16
+		lathe_spline_steps=8
+		prism_spline_steps=8
+		plane_radius=100
+		plane_step=10
+		torus_usteps=16
+		torus_vsteps=8
+		disc_usteps=16
+		disc_vsteps=8
+		max_lights=8
+		normals_size=0.5
+		objects_quality=9
+		scene_clock=0
+		use_povray_camera=1
+		show_bbox=0
+		show_dots=0
+		show_lines=1
+		show_solid=1
+		show_normals=0
+		show_planes=0
+		smooth_obj=1
+		smooth_angle=45
+		plane_alpha=0.15
+		show_camera=1
+		frustum_size=50
+
+	Also there is some extra directives without parameters:
+
+		used as:
+			// povviewer:save
+			// povviewer:end
+
+		save - new parameters will be saved into config files on exit povviewer
+		nosave - don't save parameters
+		reset - reset all parameters to default values (as in sources)
+		end - stop scanning file for parameter changes, placed as last directive. Without this
+			povviewer will scan entire given scene file. Place this parameter - and povviewer
+			will stop scan. Useful with big scene file.

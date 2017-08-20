@@ -1,0 +1,8 @@
+^povray-3.7.0.0$
+^build/povdump-3.7.0.0$
+^povviewer-3.7.0.0/build$
+^povviewer-3.7.0.0/Makefile$
+^povviewer-3.7.0.0/Makefile.Debug$
+^povviewer-3.7.0.0/Makefile.Release$
+^povviewer-3.7.0.0/.ctagsdb$
+^v3.7.0.0.tar.gz$
